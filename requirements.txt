@@ -1,0 +1,15 @@
+# Dependências do Assistente de Voz Offline (CPU).
+# Instalação padrão (CPU):
+#   pip install -r requirements.txt
+#
+# GPU NVIDIA (opcional):
+#   Instale o stack CUDA conforme a documentação do faster-whisper / ctranslate2.
+#   Depois configure DEVICE=cuda e WHISPER_COMPUTE=float16 ou int8.
+
+sounddevice
+soundfile
+numpy
+pynput
+pyperclip
+vosk
+faster-whisper

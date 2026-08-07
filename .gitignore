@@ -1,0 +1,33 @@
+# Modelos locais (pasta versionada via .gitkeep)
+models/*
+!models/.gitkeep
+
+# Ambiente virtual
+venv/
+.venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Áudio temporário / gravações
+*.wav
+wavs/
+*.flac
+*.ogg
+
+# Planos locais do agente (não versionar)
+.cursor/
+
+# IDE / SO
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
