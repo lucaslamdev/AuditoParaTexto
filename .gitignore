@@ -22,9 +22,6 @@ wavs/
 *.flac
 *.ogg
 
-# Planos locais do agente (não versionar)
-.cursor/
-
 # IDE / SO
 .idea/
 .vscode/
