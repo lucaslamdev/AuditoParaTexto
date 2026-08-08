@@ -1,23 +1,28 @@
 /* ============================================================
-   Glass UI — "vidro preto" (estilo Cursor / OpenCode)
-   Tokens de tema
+   Glass UI premium — vidro preto translúcido
    ============================================================ */
 :root {
-  --bg: rgba(12, 12, 14, 0.72);
-  --border: rgba(255, 255, 255, 0.08);
-  --text: rgba(255, 255, 255, 0.92);
-  --muted: rgba(255, 255, 255, 0.45);
-  --accent: rgba(255, 255, 255, 0.14);
+  --glass-fill: rgba(14, 14, 18, 0.42);
+  --glass-fill-strong: rgba(12, 12, 16, 0.55);
+  --glass-highlight: rgba(255, 255, 255, 0.09);
+  --glass-sheen: rgba(255, 255, 255, 0.045);
+  --border: rgba(255, 255, 255, 0.14);
+  --border-soft: rgba(255, 255, 255, 0.07);
+  --text: rgba(255, 255, 255, 0.94);
+  --muted: rgba(255, 255, 255, 0.48);
+  --accent: rgba(255, 255, 255, 0.12);
   --rec: #ff5c5c;
   --amber: #ffce7a;
-  --blur: 24px;
-  --radius: 14px;
-
-  --shadow: 0 8px 30px rgba(0, 0, 0, 0.45), 0 1px 0 rgba(255, 255, 255, 0.04) inset;
-  --font: system-ui, "Segoe UI", "SF Pro Text", "SF Pro", sans-serif;
+  --blur: 28px;
+  --radius: 16px;
+  --shadow:
+    0 12px 40px rgba(0, 0, 0, 0.45),
+    0 2px 8px rgba(0, 0, 0, 0.28),
+    inset 0 1px 0 rgba(255, 255, 255, 0.16),
+    inset 0 -1px 0 rgba(0, 0, 0, 0.25);
+  --font: "Segoe UI Variable", "Segoe UI", system-ui, "SF Pro Text", sans-serif;
 }
 
-/* Reset básico */
 *,
 *::before,
 *::after {
@@ -29,12 +34,7 @@
 html,
 body {
   height: 100%;
-}
-
-/* Fundo transparente para webview frameless */
-html,
-body {
-  background: transparent;
+  background: transparent !important;
 }
 
 body {
@@ -45,27 +45,64 @@ body {
   overflow: hidden;
 }
 
-/* ============================================================
-   Overlay (pill compacto — canto inferior direito)
-   ============================================================ */
-#overlay {
-  position: fixed;
-  right: 16px;
-  bottom: 16px;
-  width: 348px;
-  max-width: calc(100vw - 32px);
-  padding: 10px 12px;
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-
-  background: var(--bg);
+/* Superfície de vidro compartilhada */
+.glass-surface {
+  background:
+    linear-gradient(145deg, var(--glass-highlight) 0%, transparent 42%),
+    linear-gradient(180deg, var(--glass-sheen), transparent 55%),
+    var(--glass-fill);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(160%);
+  backdrop-filter: blur(var(--blur)) saturate(160%);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
-  -webkit-backdrop-filter: blur(var(--blur));
-  backdrop-filter: blur(var(--blur));
+}
+
+/* ============================================================
+   Overlay (pill compacto)
+   ============================================================ */
+#overlay {
+  position: fixed;
+  inset: 6px;
+  padding: 14px 14px;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 8px;
+
+  background:
+    radial-gradient(120% 140% at 100% 0%, rgba(255, 255, 255, 0.1), transparent 55%),
+    linear-gradient(160deg, rgba(255, 255, 255, 0.07) 0%, transparent 40%),
+    var(--glass-fill);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(170%);
+  backdrop-filter: blur(var(--blur)) saturate(170%);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow);
   user-select: none;
+  isolation: isolate;
+}
+
+/* Reflexo superior (borda iluminada) */
+#overlay::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  background: linear-gradient(
+    180deg,
+    rgba(255, 255, 255, 0.14) 0%,
+    rgba(255, 255, 255, 0.03) 18%,
+    transparent 42%
+  );
+  opacity: 0.9;
+  z-index: 0;
+}
+
+#overlay > * {
+  position: relative;
+  z-index: 1;
 }
 
 .overlay-row {
@@ -82,7 +119,6 @@ body {
   min-width: 0;
 }
 
-/* Indicador de estado (dot) */
 .dot {
   width: 9px;
   height: 9px;
@@ -102,21 +138,27 @@ body {
   white-space: nowrap;
 }
 
-/* Engine atual (tag discreta) */
 .engine-tag {
   font-size: 11px;
   font-weight: 500;
   color: var(--muted);
-  padding: 2px 7px;
-  border: 1px solid var(--border);
+  padding: 2px 8px;
+  border: 1px solid var(--border-soft);
   border-radius: 999px;
+  background: rgba(255, 255, 255, 0.04);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   max-width: 120px;
 }
 
-/* Botão ⚙ */
+.overlay-actions {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex: 0 0 auto;
+}
+
 .icon-btn {
   flex: 0 0 auto;
   width: 28px;
@@ -137,6 +179,7 @@ body {
 .icon-btn:hover {
   color: var(--text);
   background: var(--accent);
+  border-color: var(--border-soft);
 }
 
 .icon-btn:focus-visible {
@@ -144,7 +187,39 @@ body {
   border-color: rgba(255, 255, 255, 0.35);
 }
 
-/* Última linha transcrita (truncada) */
+.quit-btn {
+  color: #ffffff;
+  font-size: 20px;
+  font-weight: 400;
+  line-height: 1;
+}
+
+.quit-btn:hover {
+  color: #ffffff;
+  background: rgba(255, 255, 255, 0.12);
+}
+
+.level {
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+#level-bar {
+  height: 100%;
+  width: 0%;
+  border-radius: 999px;
+  background: linear-gradient(90deg, #4ade80, #ffce7a 70%, #ff5c5c);
+  transition: width 90ms linear;
+  box-shadow: 0 0 8px rgba(74, 222, 128, 0.35);
+}
+
+#overlay:not(.state-recording) .level {
+  visibility: hidden;
+}
+
 .last-text {
   font-size: 12px;
   color: var(--muted);
@@ -160,21 +235,17 @@ body {
 }
 
 /* ============================================================
-   Estados do overlay
+   Estados
    ============================================================ */
-
-/* idle — dot cinza (default) */
 #overlay.state-idle .dot {
   background: var(--muted);
 }
 
-/* recording — dot vermelho com pulse */
 #overlay.state-recording .dot {
   background: var(--rec);
   animation: pulse 1.4s ease-out infinite;
 }
 
-/* transcribing — dot âmbar com shimmer */
 #overlay.state-transcribing .dot {
   background: var(--amber);
   animation: shimmer 1.1s ease-in-out infinite;
@@ -212,24 +283,23 @@ body {
 }
 
 /* ============================================================
-   Drawer de configurações (painel glass maior)
+   Drawer de configurações
    ============================================================ */
 #settings.drawer {
   position: fixed;
-  right: 16px;
-  bottom: 16px;
-  width: 400px;
-  max-width: calc(100vw - 32px);
-  max-height: calc(100vh - 32px);
+  inset: 6px;
   overflow-y: auto;
-  padding: 18px;
+  padding: 16px;
 
-  background: var(--bg);
+  background:
+    radial-gradient(120% 100% at 0% 0%, rgba(255, 255, 255, 0.08), transparent 50%),
+    linear-gradient(165deg, rgba(255, 255, 255, 0.06), transparent 40%),
+    var(--glass-fill-strong);
+  -webkit-backdrop-filter: blur(var(--blur)) saturate(170%);
+  backdrop-filter: blur(var(--blur)) saturate(170%);
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
-  -webkit-backdrop-filter: blur(var(--blur));
-  backdrop-filter: blur(var(--blur));
   z-index: 10;
 }
 
@@ -238,6 +308,10 @@ body {
 }
 
 .drawer-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   margin-bottom: 14px;
 }
 
@@ -246,6 +320,7 @@ body {
   font-weight: 600;
   color: var(--text);
   letter-spacing: 0.01em;
+  margin: 0;
 }
 
 #settings-form {
@@ -264,7 +339,10 @@ body {
   color: var(--muted);
 }
 
-/* Inputs / selects escuros translúcidos */
+#settings-form label[hidden] {
+  display: none;
+}
+
 #settings-form select,
 #settings-form input[type="text"] {
   font-family: inherit;
@@ -272,13 +350,15 @@ body {
   font-weight: 400;
   letter-spacing: normal;
   color: var(--text);
-  background: rgba(255, 255, 255, 0.05);
-  border: 1px solid var(--border);
-  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-soft);
+  border-radius: 10px;
   padding: 8px 10px;
   width: 100%;
-  transition: border-color 140ms ease, background 140ms ease;
+  transition: border-color 140ms ease, background 140ms ease, box-shadow 140ms ease;
   appearance: none;
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
 }
 
 #settings-form select {
@@ -290,7 +370,7 @@ body {
 }
 
 #settings-form option {
-  background: #141416;
+  background: #141418;
   color: var(--text);
 }
 
@@ -300,17 +380,18 @@ body {
 
 #settings-form select:hover,
 #settings-form input[type="text"]:hover {
-  background: rgba(255, 255, 255, 0.07);
+  background-color: rgba(255, 255, 255, 0.09);
+  border-color: var(--border);
 }
 
 #settings-form select:focus,
 #settings-form input[type="text"]:focus {
   outline: none;
-  border-color: rgba(255, 255, 255, 0.4);
-  background: rgba(255, 255, 255, 0.08);
+  border-color: rgba(255, 255, 255, 0.42);
+  background-color: rgba(255, 255, 255, 0.1);
+  box-shadow: 0 0 0 3px rgba(255, 255, 255, 0.06);
 }
 
-/* Ações (botões) */
 .actions {
   display: flex;
   justify-content: flex-end;
@@ -323,7 +404,7 @@ body {
   font-size: 13px;
   font-weight: 600;
   padding: 8px 16px;
-  border-radius: 9px;
+  border-radius: 10px;
   border: 1px solid transparent;
   cursor: pointer;
   transition: background 140ms ease, border-color 140ms ease, color 140ms ease;
@@ -334,22 +415,22 @@ body {
   border-color: rgba(255, 255, 255, 0.45);
 }
 
-/* Salvar — destaque sutil */
 .btn-primary {
   color: var(--text);
   background: rgba(255, 255, 255, 0.16);
   border-color: var(--border);
+  -webkit-backdrop-filter: blur(8px);
+  backdrop-filter: blur(8px);
 }
 
 .btn-primary:hover {
   background: rgba(255, 255, 255, 0.24);
 }
 
-/* Fechar — ghost */
 .btn-ghost {
   color: var(--muted);
-  background: transparent;
-  border-color: var(--border);
+  background: rgba(255, 255, 255, 0.04);
+  border-color: var(--border-soft);
 }
 
 .btn-ghost:hover {
@@ -357,9 +438,33 @@ body {
   background: var(--accent);
 }
 
-/* ============================================================
-   Scrollbar fina (drawer)
-   ============================================================ */
+/* Toast */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%);
+  z-index: 50;
+  padding: 8px 14px;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text);
+  background: rgba(20, 20, 24, 0.72);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  -webkit-backdrop-filter: blur(16px) saturate(150%);
+  backdrop-filter: blur(16px) saturate(150%);
+  pointer-events: none;
+  opacity: 0;
+  transition: opacity 180ms ease;
+}
+
+.toast.show {
+  opacity: 1;
+}
+
+/* Scrollbar */
 #settings.drawer {
   scrollbar-width: thin;
   scrollbar-color: rgba(255, 255, 255, 0.18) transparent;

@@ -14,6 +14,7 @@ const ROTULOS_ESTADO = {
 // Campos do formulário (name no HTML == chave da config).
 const CAMPOS_CONFIG = [
   "ENGINE",
+  "INPUT_DEVICE",
   "WHISPER_SIZE",
   "WHISPER_COMPUTE",
   "DEVICE",
@@ -50,14 +51,39 @@ function updateStatus(payload) {
   if (engine && typeof payload.engine === "string" && payload.engine) {
     engine.textContent = payload.engine;
   }
-  if (lastText && payload.last_text !== undefined) {
-    lastText.textContent = payload.last_text || "";
+  // Durante a gravação, prioriza o parcial ao vivo (streaming Vosk); fora dela,
+  // mostra o último texto reconhecido. O polling de get_status entrega ambos.
+  if (lastText) {
+    if (state === "recording" && payload.live !== undefined) {
+      lastText.textContent = payload.live || "";
+    } else if (payload.last_text !== undefined) {
+      lastText.textContent = payload.last_text || "";
+    }
   }
+  // Nível do microfone também via polling (mais confiável que evaluate_js).
+  if (payload.level !== undefined) updateLevel(payload.level);
+}
+
+// Mostra o texto parcial ao vivo (streaming) no overlay enquanto grava.
+function updateLive(texto) {
+  const lastText = document.getElementById("last-text");
+  if (lastText) lastText.textContent = texto || "";
+}
+
+// Atualiza o medidor de nível do microfone (pico 0..1).
+function updateLevel(pico) {
+  const bar = document.getElementById("level-bar");
+  if (!bar) return;
+  // Escala não-linear para dar destaque a níveis baixos de fala.
+  const pct = Math.max(0, Math.min(100, Math.sqrt(pico) * 140));
+  bar.style.width = pct + "%";
 }
 
 // Expõe globais para o Python chamar via evaluate_js.
 window.updateStatus = updateStatus;
 window.setStatus = setStatus;
+window.updateLive = updateLive;
+window.updateLevel = updateLevel;
 
 // ---- Ponte de configuração --------------------------------------------
 
@@ -88,6 +114,18 @@ function preencherForm(cfg) {
     if (el && cfg[chave] !== undefined && cfg[chave] !== null) {
       el.value = String(cfg[chave]);
     }
+  });
+}
+
+// Mostra/oculta campos específicos de cada motor conforme o ENGINE escolhido.
+function atualizarCamposPorEngine() {
+  const sel = document.querySelector('[name="ENGINE"]');
+  const engine = sel ? sel.value : "vosk";
+  document.querySelectorAll(".engine-whisper").forEach((el) => {
+    el.hidden = engine !== "whisper";
+  });
+  document.querySelectorAll(".engine-vosk").forEach((el) => {
+    el.hidden = engine !== "vosk";
   });
 }
 
@@ -124,9 +162,38 @@ async function saveConfig() {
 
 // ---- Drawer de configurações ------------------------------------------
 
+// Popula o seletor de microfones a partir da API do Python.
+async function popularMicrofones(valorAtual) {
+  const sel = document.getElementById("field-input-device");
+  if (!sel || !(temApi() && window.pywebview.api.list_input_devices)) return;
+  try {
+    const devs = (await window.pywebview.api.list_input_devices()) || [];
+    sel.innerHTML = '<option value="">Padrão do sistema</option>';
+    devs.forEach((d) => {
+      const opt = document.createElement("option");
+      opt.value = String(d.index);
+      opt.textContent = "[" + d.index + "] " + d.name;
+      sel.appendChild(opt);
+    });
+    if (valorAtual !== undefined && valorAtual !== null && valorAtual !== "") {
+      sel.value = String(valorAtual);
+    }
+  } catch (e) {
+    console.error("Falha ao listar microfones:", e);
+  }
+}
+
 async function openSettings() {
   const cfg = await loadConfig();
+  await popularMicrofones(cfg.INPUT_DEVICE);
   preencherForm(cfg);
+  atualizarCamposPorEngine();
+  // Expande a janela para caber o painel (transparência não é confiável no Windows).
+  if (temApi() && window.pywebview.api.resize_window) {
+    try {
+      await window.pywebview.api.resize_window("settings");
+    } catch (e) {}
+  }
   const el = document.getElementById("settings");
   if (el) el.hidden = false;
 }
@@ -134,6 +201,12 @@ async function openSettings() {
 function closeSettings() {
   const el = document.getElementById("settings");
   if (el) el.hidden = true;
+  // Volta ao tamanho compacto do overlay.
+  if (temApi() && window.pywebview.api.resize_window) {
+    try {
+      window.pywebview.api.resize_window("overlay");
+    } catch (e) {}
+  }
 }
 
 // ---- Toast -------------------------------------------------------------
@@ -169,7 +242,20 @@ function startStatusPolling() {
     } catch (e) {
       // UI/bridge indisponível: ignora silenciosamente.
     }
-  }, 400);
+  }, 150);
+}
+
+// Fecha o programa (pede ao Python destruir a janela PyWebView).
+async function quitApp() {
+  if (temApi() && window.pywebview.api.quit) {
+    try {
+      await window.pywebview.api.quit();
+      return;
+    } catch (e) {
+      console.error("Falha ao fechar via API:", e);
+    }
+  }
+  window.close();
 }
 
 // ---- Inicialização -----------------------------------------------------
@@ -177,10 +263,18 @@ function startStatusPolling() {
 document.addEventListener("DOMContentLoaded", () => {
   const btnSettings = document.getElementById("btn-settings");
   const btnClose = document.getElementById("btn-close");
+  const btnQuit = document.getElementById("btn-quit");
+  const btnQuitSettings = document.getElementById("btn-quit-settings");
   const form = document.getElementById("settings-form");
 
   if (btnSettings) btnSettings.addEventListener("click", openSettings);
   if (btnClose) btnClose.addEventListener("click", closeSettings);
+  if (btnQuit) btnQuit.addEventListener("click", quitApp);
+  if (btnQuitSettings) btnQuitSettings.addEventListener("click", quitApp);
+
+  const selEngine = document.querySelector('[name="ENGINE"]');
+  if (selEngine) selEngine.addEventListener("change", atualizarCamposPorEngine);
+
   if (form) {
     form.addEventListener("submit", (e) => {
       e.preventDefault();

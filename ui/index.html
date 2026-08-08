@@ -4,6 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Assistente de Voz</title>
+  <style>html,body{background:transparent!important}</style>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -15,8 +16,12 @@
         <span id="status-label">idle</span>
         <span id="engine" class="engine-tag">—</span>
       </div>
-      <button id="btn-settings" class="icon-btn" type="button" title="Configurações" aria-label="Configurações">⚙</button>
+      <div class="overlay-actions">
+        <button id="btn-settings" class="icon-btn" type="button" title="Configurações" aria-label="Configurações">⚙</button>
+        <button id="btn-quit" class="icon-btn quit-btn" type="button" title="Fechar" aria-label="Fechar">×</button>
+      </div>
     </div>
+    <div class="level" aria-hidden="true"><div id="level-bar"></div></div>
     <div id="last-text" class="last-text"></div>
   </div>
 
@@ -24,6 +29,7 @@
   <div id="settings" class="drawer" hidden>
     <div class="drawer-header">
       <h2>Configurações</h2>
+      <button id="btn-quit-settings" class="icon-btn quit-btn" type="button" title="Fechar" aria-label="Fechar">×</button>
     </div>
     <form id="settings-form">
       <label>
@@ -35,6 +41,13 @@
       </label>
 
       <label>
+        MICROFONE
+        <select name="INPUT_DEVICE" id="field-input-device">
+          <option value="">Padrão do sistema</option>
+        </select>
+      </label>
+
+      <label class="engine-whisper">
         WHISPER_SIZE
         <select name="WHISPER_SIZE" id="field-whisper-size">
           <option value="tiny">tiny</option>
@@ -45,7 +58,7 @@
         </select>
       </label>
 
-      <label>
+      <label class="engine-whisper">
         WHISPER_COMPUTE
         <select name="WHISPER_COMPUTE" id="field-whisper-compute">
           <option value="int8">int8</option>
@@ -54,12 +67,12 @@
         </select>
       </label>
 
-      <label>
+      <label class="engine-whisper">
         DEVICE
         <select name="DEVICE" id="field-device">
+          <option value="auto">auto</option>
           <option value="cpu">cpu</option>
           <option value="cuda">cuda</option>
-          <option value="auto">auto</option>
         </select>
       </label>
 
@@ -76,7 +89,7 @@
         <input type="text" name="HOTKEY" id="field-hotkey" placeholder="ex: ctrl+alt+space">
       </label>
 
-      <label>
+      <label class="engine-vosk">
         VOSK_MODEL_PATH
         <input type="text" name="VOSK_MODEL_PATH" id="field-vosk-path" placeholder="caminho do modelo vosk">
       </label>

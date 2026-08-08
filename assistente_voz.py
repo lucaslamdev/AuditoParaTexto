@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import queue
 import sys
 import tempfile
 import threading
@@ -33,12 +34,13 @@ from pynput import keyboard
 ENGINE = "vosk"  # vosk | whisper
 WHISPER_SIZE = "base"  # tiny | base | small | medium | turbo
 WHISPER_COMPUTE = "int8"  # int8 | float16 | float32
-DEVICE = "cpu"  # cpu | cuda | auto
+DEVICE = "auto"  # auto | cpu | cuda — auto tenta GPU e cai para CPU se faltar CUDA/cuBLAS
 OUTPUT_MODE = "type"  # type | clipboard
 HOTKEY = "Ctrl+Shift+Space"  # formato pynput
 VOSK_MODEL_PATH = str(Path(__file__).resolve().parent / "models" / "vosk-model-small-pt")
 SAMPLE_RATE = 16000  # Hz — valor fixo contratual
 MIN_AUDIO_SECONDS = 0.3  # gravações abaixo disso são descartadas (ruído de toque)
+INPUT_DEVICE = None  # índice do microfone (int) ou None = padrão do sistema
 
 # === LOGGING ===
 logging.basicConfig(
@@ -68,6 +70,7 @@ _CONFIG_CHOICES: dict[str, Optional[frozenset[str]]] = {
     "VOSK_MODEL_PATH": None,
     "SAMPLE_RATE": None,
     "MIN_AUDIO_SECONDS": None,
+    "INPUT_DEVICE": None,
 }
 
 
@@ -88,6 +91,7 @@ def _config_defaults() -> dict:
         "VOSK_MODEL_PATH": "models/vosk-model-small-pt",
         "SAMPLE_RATE": SAMPLE_RATE,
         "MIN_AUDIO_SECONDS": MIN_AUDIO_SECONDS,
+        "INPUT_DEVICE": INPUT_DEVICE,
     }
 
 
@@ -159,6 +163,21 @@ def _validar_config(cfg: dict) -> dict:
                 validado[chave] = padrao
             continue
 
+        # INPUT_DEVICE: índice inteiro do microfone ou None (padrão do sistema)
+        if chave == "INPUT_DEVICE":
+            if valor is None or valor == "" or str(valor).strip().lower() in ("none", "padrao", "padrão"):
+                validado[chave] = None
+            else:
+                try:
+                    validado[chave] = int(valor)
+                except (TypeError, ValueError):
+                    log.warning(
+                        "Config: valor inválido para 'INPUT_DEVICE' (%r); usando padrão do sistema.",
+                        valor,
+                    )
+                    validado[chave] = None
+            continue
+
         # HOTKEY / VOSK_MODEL_PATH: string não vazia
         texto = str(valor).strip()
         if not texto:
@@ -226,7 +245,7 @@ def apply_config_to_globals(cfg: dict) -> None:
     VOSK_MODEL_PATH são resolvidos em relação à pasta do script.
     """
     global ENGINE, WHISPER_SIZE, WHISPER_COMPUTE, DEVICE, OUTPUT_MODE
-    global HOTKEY, VOSK_MODEL_PATH, SAMPLE_RATE, MIN_AUDIO_SECONDS
+    global HOTKEY, VOSK_MODEL_PATH, SAMPLE_RATE, MIN_AUDIO_SECONDS, INPUT_DEVICE
 
     validado = _validar_config(cfg)
 
@@ -238,6 +257,7 @@ def apply_config_to_globals(cfg: dict) -> None:
     HOTKEY = validado["HOTKEY"]
     SAMPLE_RATE = int(validado["SAMPLE_RATE"])
     MIN_AUDIO_SECONDS = float(validado["MIN_AUDIO_SECONDS"])
+    INPUT_DEVICE = validado["INPUT_DEVICE"]
 
     # Resolve caminho relativo do modelo Vosk contra a pasta do script
     caminho_modelo = Path(validado["VOSK_MODEL_PATH"])
@@ -280,6 +300,20 @@ _audio_lock = threading.Lock()
 _input_stream: Optional[sd.InputStream] = None
 _gravando = False
 
+_mic_pico_max = 0.0          # maior pico visto na gravação atual (diagnóstico)
+_nivel_ultimo_envio = 0.0    # timestamp do último push de nível (throttle)
+
+
+def _atualizar_nivel_mic(pico: float) -> None:
+    """Registra o pico do microfone e envia o nível ao overlay (~10x/s)."""
+    global _mic_pico_max, _nivel_ultimo_envio
+    if pico > _mic_pico_max:
+        _mic_pico_max = pico
+    agora = time.time()
+    if agora - _nivel_ultimo_envio >= 0.1:
+        _nivel_ultimo_envio = agora
+        push_level(pico)
+
 
 def _audio_callback(
     indata: np.ndarray,
@@ -291,8 +325,18 @@ def _audio_callback(
     if status:
         log.warning("Aviso PortAudio na captura: %s", status)
     # Cópia: indata é reutilizado pelo PortAudio após o retorno do callback
+    bloco = indata.copy()
     with _audio_lock:
-        _audio_chunks.append(indata.copy())
+        _audio_chunks.append(bloco)
+    # Medidor de nível (pico do bloco) enviado ao overlay de forma throttled.
+    try:
+        pico = float(np.max(np.abs(bloco))) if bloco.size else 0.0
+        _atualizar_nivel_mic(pico)
+    except Exception:
+        pass
+    # Se o streaming Vosk estiver ativo, alimenta o reconhecedor ao vivo.
+    if vosk_stream_ativo():
+        vosk_stream_feed(bloco)
 
 
 def _mensagem_erro_audio(exc: BaseException) -> str:
@@ -349,6 +393,8 @@ def start_recording() -> None:
         log.warning("Gravação já em andamento; ignore start_recording duplicado.")
         return
 
+    global _mic_pico_max
+    _mic_pico_max = 0.0
     with _audio_lock:
         _audio_chunks.clear()
 
@@ -363,6 +409,7 @@ def start_recording() -> None:
             samplerate=SAMPLE_RATE,
             channels=1,
             dtype="float32",
+            device=INPUT_DEVICE,  # None = dispositivo padrão do sistema
             callback=_audio_callback,
         )
         stream.start()
@@ -422,7 +469,14 @@ def stop_recording(*, as_wav: bool = False) -> Optional[Union[np.ndarray, Path]]
     audio = np.asarray(audio, dtype=np.float32)
 
     duracao = audio.shape[0] / float(SAMPLE_RATE)
-    log.info("Gravação encerrada: %.2fs, %d amostras.", duracao, audio.shape[0])
+    log.info(
+        "Gravação encerrada: %.2fs, %d amostras. Pico do mic=%.4f%s",
+        duracao,
+        audio.shape[0],
+        _mic_pico_max,
+        "  (ATENÇÃO: nível muito baixo — verifique o microfone selecionado/ganho)"
+        if _mic_pico_max < 0.02 else "",
+    )
 
     if not as_wav:
         return audio
@@ -529,9 +583,22 @@ def _pipeline_apos_parar() -> None:
                 duracao,
                 MIN_AUDIO_SECONDS,
             )
+            # Descarta o streaming acumulado para não vazar para a próxima gravação
+            if vosk_stream_ativo():
+                vosk_stream_finish()
+            if whisper_stream_ativo():
+                whisper_stream_finish()
             return
 
-        texto = transcribe(audio)
+        # Vosk em streaming: usa o texto já reconhecido ao vivo (evita reprocessar).
+        if vosk_stream_ativo():
+            texto = vosk_stream_finish()
+        else:
+            # Whisper: para o preview antes da transcrição final (evita uso
+            # concorrente do modelo) e transcreve o áudio completo.
+            if whisper_stream_ativo():
+                whisper_stream_finish()
+            texto = transcribe(audio)
         if not texto or not str(texto).strip():
             log.info("Transcrição vazia — nada a entregar.")
             return
@@ -550,9 +617,22 @@ def _pipeline_apos_parar() -> None:
     except Exception as exc:
         log.error("Falha no pipeline pós-gravação: %s", exc)
     finally:
+        # Se algo interrompeu antes de finalizar o streaming, encerra para não
+        # vazar estado do reconhecedor para a próxima gravação.
+        if vosk_stream_ativo():
+            try:
+                vosk_stream_finish()
+            except Exception as exc:
+                log.debug("Falha ao encerrar streaming Vosk no finally: %s", exc)
+        if whisper_stream_ativo():
+            try:
+                whisper_stream_finish()
+            except Exception as exc:
+                log.debug("Falha ao encerrar preview Whisper no finally: %s", exc)
         _set_estado("idle")
-        # Garante UI em idle mesmo nos caminhos de erro/áudio vazio (sem tocar last_text)
-        set_ui_state("idle")
+        # Só força idle na UI se ainda não voltamos (sucesso já setou com last_text).
+        if _ui_state != "idle":
+            set_ui_state("idle")
         log.info("Estado: idle (pronto para nova gravação).")
 
 
@@ -579,20 +659,43 @@ def _on_hotkey() -> None:
             iniciar = False
 
     if iniciar:
+        # Guarda a janela em foco (onde o usuário quer o texto) antes do overlay
+        # ou de qualquer outra coisa roubar o foreground.
+        _capturar_janela_alvo()
+        # Ativa a transcrição ao vivo conforme o ENGINE (best-effort). Vosk usa
+        # streaming nativo; Whisper usa re-transcrição periódica (pseudo-stream).
+        engine_atual = (ENGINE or "").strip().lower()
+        if engine_atual == "vosk":
+            try:
+                vosk_stream_start()
+            except Exception as exc:
+                log.debug("Não foi possível ativar o streaming Vosk: %s", exc)
+        elif engine_atual == "whisper":
+            try:
+                whisper_stream_start()
+            except Exception as exc:
+                log.debug("Não foi possível ativar o preview Whisper: %s", exc)
         try:
             start_recording()
         except Exception as exc:
             _set_estado("idle")
+            # Cancela um eventual streaming iniciado se o mic falhar
+            if vosk_stream_ativo():
+                vosk_stream_finish()
+            if whisper_stream_ativo():
+                whisper_stream_finish()
             # UI: falha ao iniciar mic → mantém idle
             set_ui_state("idle")
             log.error("Não foi possível iniciar gravação: %s", exc)
             return
         # UI: gravação iniciada
-        set_ui_state("recording")
+        set_ui_state("recording", last_text="")
         print("[REC]", flush=True)
         log.info("[REC] gravação ativa — pressione %s de novo para parar.", HOTKEY)
         return
 
+    # Recaptura o alvo no STOP (usuário ainda deve estar no editor).
+    _capturar_janela_alvo()
     print("[STOP]", flush=True)
     log.info("[STOP] encerrando gravação e disparando transcrição...")
     threading.Thread(
@@ -684,6 +787,140 @@ def transcribe_vosk(audio: np.ndarray) -> str:
     return texto
 
 
+# --- Vosk em streaming (transcrição ao vivo) ---------------------------------
+# Durante a gravação, o áudio é alimentado ao KaldiRecognizer em tempo real e os
+# resultados parciais são exibidos no overlay. Ao parar, o texto final é montado
+# a partir dos segmentos já confirmados + o resultado final.
+
+_vosk_stream_rec = None            # KaldiRecognizer ativo (ou None)
+_vosk_stream_queue: Optional["queue.Queue"] = None
+_vosk_stream_thread: Optional[threading.Thread] = None
+_vosk_stream_active = False        # True enquanto o consumidor deve processar
+_vosk_stream_segmentos: list[str] = []  # segmentos confirmados (Result)
+_vosk_stream_lock = threading.Lock()
+_vosk_live_text = ""               # texto parcial atual (lido pela UI via polling)
+
+
+def vosk_live_text() -> str:
+    """Texto parcial atual do streaming (para o overlay ler via get_status)."""
+    return _vosk_live_text
+
+
+def _vosk_stream_consumidor() -> None:
+    """Thread consumidora: puxa PCM da fila e alimenta o reconhecedor Vosk.
+
+    Emite os parciais para o overlay via push_live(). Encerra ao receber o
+    sentinela None na fila.
+    """
+    global _vosk_stream_segmentos
+    while True:
+        try:
+            data = _vosk_stream_queue.get(timeout=0.2)
+        except queue.Empty:
+            continue
+        if data is None:  # sentinela de término
+            break
+        try:
+            if _vosk_stream_rec.AcceptWaveform(data):
+                seg = str(json.loads(_vosk_stream_rec.Result()).get("text") or "").strip()
+                if seg:
+                    with _vosk_stream_lock:
+                        _vosk_stream_segmentos.append(seg)
+                    push_live(_vosk_texto_ao_vivo(""))
+            else:
+                parcial = str(
+                    json.loads(_vosk_stream_rec.PartialResult()).get("partial") or ""
+                ).strip()
+                push_live(_vosk_texto_ao_vivo(parcial))
+        except Exception as exc:  # não deixa a thread morrer silenciosamente
+            log.debug("Consumidor Vosk stream: %s", exc)
+
+
+def _vosk_texto_ao_vivo(parcial: str) -> str:
+    """Junta os segmentos já confirmados com o parcial atual (para preview)."""
+    with _vosk_stream_lock:
+        partes = list(_vosk_stream_segmentos)
+    if parcial:
+        partes.append(parcial)
+    return " ".join(partes).strip()
+
+
+def vosk_stream_start() -> bool:
+    """Inicia a transcrição em streaming do Vosk.
+
+    Carrega o modelo (sob demanda), cria o reconhecedor e sobe a thread
+    consumidora. Retorna True se ativou; False se o modelo estiver ausente
+    (nesse caso o pipeline cai no modo por bloco, que reporta o erro).
+    """
+    global _vosk_stream_rec, _vosk_stream_queue, _vosk_stream_thread
+    global _vosk_stream_active, _vosk_stream_segmentos, _vosk_live_text
+
+    from vosk import KaldiRecognizer
+
+    try:
+        model = load_vosk_model(VOSK_MODEL_PATH)
+    except RuntimeError as exc:
+        log.warning("Streaming Vosk indisponível: %s", exc)
+        return False
+
+    _vosk_stream_rec = KaldiRecognizer(model, SAMPLE_RATE)
+    _vosk_stream_queue = queue.Queue()
+    with _vosk_stream_lock:
+        _vosk_stream_segmentos = []
+    _vosk_live_text = ""
+    _vosk_stream_active = True
+    _vosk_stream_thread = threading.Thread(
+        target=_vosk_stream_consumidor,
+        name="vosk-stream",
+        daemon=True,
+    )
+    _vosk_stream_thread.start()
+    log.info("Streaming Vosk ativo — transcrição ao vivo.")
+    return True
+
+
+def vosk_stream_feed(audio_float32: np.ndarray) -> None:
+    """Enfileira um bloco de áudio (float32) convertido para PCM int16."""
+    if not _vosk_stream_active or _vosk_stream_queue is None:
+        return
+    samples = np.asarray(audio_float32, dtype=np.float32).reshape(-1)
+    pcm = (np.clip(samples, -1.0, 1.0) * 32767.0).astype(np.int16)
+    _vosk_stream_queue.put(pcm.tobytes())
+
+
+def vosk_stream_finish() -> str:
+    """Encerra o streaming e retorna o texto final acumulado."""
+    global _vosk_stream_active
+    if not _vosk_stream_active:
+        return ""
+
+    _vosk_stream_active = False
+    if _vosk_stream_queue is not None:
+        _vosk_stream_queue.put(None)  # sentinela
+    if _vosk_stream_thread is not None:
+        _vosk_stream_thread.join(timeout=5.0)
+
+    final = ""
+    if _vosk_stream_rec is not None:
+        try:
+            final = str(json.loads(_vosk_stream_rec.FinalResult()).get("text") or "").strip()
+        except Exception as exc:
+            log.debug("FinalResult Vosk stream: %s", exc)
+
+    with _vosk_stream_lock:
+        partes = list(_vosk_stream_segmentos)
+    if final:
+        partes.append(final)
+    texto = " ".join(partes).strip()
+    log.info("Streaming Vosk finalizado → %d chars.", len(texto))
+    return texto
+
+
+def vosk_stream_ativo() -> bool:
+    """Indica se o streaming Vosk está ativo no momento."""
+    return _vosk_stream_active
+
+
 # === FIM ENGINE: VOSK ===
 
 
@@ -691,25 +928,34 @@ def transcribe_vosk(audio: np.ndarray) -> str:
 # Implementação do motor Whisper (tamanho, compute e DEVICE).
 
 _whisper_model = None  # cache do faster_whisper.WhisperModel (carregado sob demanda)
+_whisper_device = None  # dispositivo efetivamente usado ("cpu"/"cuda") p/ fallback
+_whisper_lock = threading.Lock()  # serializa load/transcribe (preview + final)
+_whisper_force_cpu = False  # grudento: após falha de CUDA/cuBLAS, fica em CPU
 
 _WHISPER_SIZES = frozenset({"tiny", "base", "small", "medium", "turbo"})
 _WHISPER_COMPUTE_TYPES = frozenset({"int8", "float16", "float32"})
 _WHISPER_DEVICES = frozenset({"cpu", "cuda", "auto"})
 
 
-def load_whisper_model():
+def load_whisper_model(force_cpu: bool = False):
     """
     Carrega ``faster_whisper.WhisperModel`` com cache em variável de módulo.
 
     Usa ``WHISPER_SIZE``, ``DEVICE`` e ``WHISPER_COMPUTE`` da configuração.
     Se ``DEVICE`` for ``cuda``/``auto`` e a carga falhar, faz fallback para CPU
-    e registra o aviso em português.
+    e registra o aviso em português. Com ``force_cpu=True`` ignora o DEVICE e
+    carrega direto em CPU (usado no fallback em tempo de transcrição).
     """
-    global _whisper_model
+    global _whisper_model, _whisper_device, _whisper_force_cpu
 
-    if _whisper_model is not None:
+    if _whisper_model is not None and not force_cpu:
         log.debug("Modelo Whisper já em memória (cache).")
         return _whisper_model
+
+    # Grudento: se o cuBLAS/CUDA já falhou nesta sessão, sempre usa CPU (evita
+    # reabrir a mesma falha e o thrashing entre auto↔cpu).
+    if _whisper_force_cpu:
+        force_cpu = True
 
     from faster_whisper import WhisperModel
 
@@ -731,14 +977,21 @@ def load_whisper_model():
         )
         compute = "int8"
 
-    device = (DEVICE or "cpu").strip().lower()
+    device = (DEVICE or "auto").strip().lower()
     if device not in _WHISPER_DEVICES:
         log.warning(
-            "DEVICE=%r inválido; usando 'cpu'. Válidos: %s.",
+            "DEVICE=%r inválido; usando 'auto'. Válidos: %s.",
             DEVICE,
             ", ".join(sorted(_WHISPER_DEVICES)),
         )
+        device = "auto"
+
+    # float16 não é suportado em CPU pelo ctranslate2 → cai para int8
+    if force_cpu:
         device = "cpu"
+    if device == "cpu" and compute == "float16":
+        log.info("float16 não é suportado em CPU; usando int8.")
+        compute = "int8"
 
     log.info(
         "Lazy-load: carregando modelo Whisper pela primeira vez "
@@ -749,6 +1002,7 @@ def load_whisper_model():
     )
     try:
         _whisper_model = WhisperModel(size, device=device, compute_type=compute)
+        _whisper_device = device
     except Exception as exc:
         if device in ("cuda", "auto"):
             log.warning(
@@ -757,8 +1011,11 @@ def load_whisper_model():
                 device,
                 exc,
             )
+            compute_cpu = "int8" if compute == "float16" else compute
             try:
-                _whisper_model = WhisperModel(size, device="cpu", compute_type=compute)
+                _whisper_model = WhisperModel(size, device="cpu", compute_type=compute_cpu)
+                _whisper_device = "cpu"
+                _whisper_force_cpu = True  # não tenta CUDA de novo nesta sessão
             except Exception as exc_cpu:
                 raise RuntimeError(
                     f"Falha ao carregar Whisper mesmo em CPU ({exc_cpu}). "
@@ -770,7 +1027,7 @@ def load_whisper_model():
                 "Verifique faster-whisper/ctranslate2 e o tamanho do modelo."
             ) from exc
 
-    log.info("Modelo Whisper carregado e em cache (size=%s).", size)
+    log.info("Modelo Whisper carregado e em cache (size=%s, device=%s).", size, _whisper_device)
     return _whisper_model
 
 
@@ -783,13 +1040,117 @@ def transcribe_whisper(audio: np.ndarray) -> str:
     if audio is None or getattr(audio, "size", 0) == 0:
         return ""
 
-    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    model = load_whisper_model()
+    global _whisper_model, _whisper_force_cpu
 
-    segments, _info = model.transcribe(samples, language="pt")
-    texto = "".join(seg.text for seg in segments).strip()
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    # Serializa acesso ao modelo: o preview ao vivo e a transcrição final nunca
+    # rodam concorrentes (o WhisperModel não é seguro para uso simultâneo).
+    with _whisper_lock:
+        model = load_whisper_model()
+        try:
+            segments, _info = model.transcribe(samples, language="pt")
+            texto = "".join(seg.text for seg in segments).strip()
+        except Exception as exc:
+            # Ex.: cublas64_12.dll ausente quando DEVICE=cuda/auto sem CUDA.
+            if _whisper_device != "cpu":
+                log.warning(
+                    "Falha na inferência Whisper em '%s' (%s). Recarregando em CPU.",
+                    _whisper_device,
+                    exc,
+                )
+                _whisper_model = None
+                _whisper_force_cpu = True  # não tenta CUDA de novo nesta sessão
+                model = load_whisper_model(force_cpu=True)
+                segments, _info = model.transcribe(samples, language="pt")
+                texto = "".join(seg.text for seg in segments).strip()
+            else:
+                raise
     log.info("Whisper: %d amostras → %d chars.", samples.shape[0], len(texto))
     return texto
+
+
+# --- Whisper em pseudo-streaming (transcrição ao vivo) -----------------------
+# O Faster-Whisper não transcreve em fluxo contínuo como o Vosk. Para dar um
+# preview ao vivo, uma thread re-transcreve periodicamente TODO o áudio já
+# capturado e envia o resultado ao overlay. Ao parar, o pipeline faz a
+# transcrição final do áudio completo (autoritativa) — este preview é
+# best-effort e não substitui o resultado final.
+
+WHISPER_STREAM_INTERVAL = 2.0   # segundos entre re-transcrições do preview
+WHISPER_STREAM_MIN_SEG = 1.0    # só começa a transcrever após ~1s de áudio
+
+_whisper_stream_active = False
+_whisper_stream_thread: Optional[threading.Thread] = None
+_whisper_stream_stop: Optional[threading.Event] = None
+
+
+def _whisper_stream_worker() -> None:
+    """Thread do preview: re-transcreve o buffer acumulado a cada intervalo."""
+    ultimo_n = 0
+    while _whisper_stream_active:
+        # Espera o intervalo (interrompível pelo stop) antes de transcrever.
+        if _whisper_stream_stop is not None and _whisper_stream_stop.wait(
+            WHISPER_STREAM_INTERVAL
+        ):
+            break
+        if not _whisper_stream_active:
+            break
+        with _audio_lock:
+            if not _audio_chunks:
+                continue
+            audio = np.concatenate(_audio_chunks, axis=0)
+        if audio.ndim > 1:
+            audio = audio.reshape(-1)
+        n = int(audio.shape[0])
+        if n / float(SAMPLE_RATE) < WHISPER_STREAM_MIN_SEG:
+            continue
+        if n == ultimo_n:  # nada de novo desde a última passada
+            continue
+        ultimo_n = n
+        try:
+            texto = transcribe_whisper(np.asarray(audio, dtype=np.float32))
+            if _whisper_stream_active and texto:
+                push_live(texto)
+        except Exception as exc:
+            log.debug("Preview Whisper: %s", exc)
+
+
+def whisper_stream_start() -> bool:
+    """Inicia o preview ao vivo do Whisper (thread de re-transcrição)."""
+    global _whisper_stream_active, _whisper_stream_thread, _whisper_stream_stop
+    global _vosk_live_text
+    if _whisper_stream_active:
+        return True
+    _vosk_live_text = ""
+    _whisper_stream_stop = threading.Event()
+    _whisper_stream_active = True
+    _whisper_stream_thread = threading.Thread(
+        target=_whisper_stream_worker,
+        name="whisper-stream",
+        daemon=True,
+    )
+    _whisper_stream_thread.start()
+    log.info("Preview Whisper ativo — transcrição ao vivo (best-effort).")
+    return True
+
+
+def whisper_stream_finish() -> None:
+    """Encerra o preview ao vivo do Whisper e aguarda a thread finalizar."""
+    global _whisper_stream_active, _whisper_stream_thread
+    if not _whisper_stream_active:
+        return
+    _whisper_stream_active = False
+    if _whisper_stream_stop is not None:
+        _whisper_stream_stop.set()
+    thread = _whisper_stream_thread
+    if thread is not None and thread.is_alive():
+        thread.join(timeout=5.0)
+    _whisper_stream_thread = None
+
+
+def whisper_stream_ativo() -> bool:
+    """True enquanto o preview ao vivo do Whisper estiver rodando."""
+    return _whisper_stream_active
 
 
 # === FIM ENGINE: WHISPER ===
@@ -822,6 +1183,46 @@ def _mensagem_erro_saida(exc: BaseException) -> str:
     return f"Não foi possível entregar o texto ({detalhe}). {dica}"
 
 
+# Handle da janela em foco quando a gravação começa/para (Windows).
+# Usado para restaurar o foco antes de colar o texto — sem isso o type
+# costuma cair no overlay do PyWebView ou em lugar nenhum.
+_target_hwnd = None
+
+
+def _capturar_janela_alvo() -> None:
+    """Guarda a janela em primeiro plano (Windows) para restaurar no deliver."""
+    global _target_hwnd
+    if sys.platform != "win32":
+        _target_hwnd = None
+        return
+    try:
+        import ctypes
+
+        hwnd = ctypes.windll.user32.GetForegroundWindow()
+        _target_hwnd = int(hwnd) if hwnd else None
+    except Exception as exc:
+        log.debug("Não foi possível capturar janela alvo: %s", exc)
+        _target_hwnd = None
+
+
+def _focar_janela_alvo() -> bool:
+    """Restaura o foco na janela capturada. Retorna True se tentou com sucesso."""
+    if sys.platform != "win32" or not _target_hwnd:
+        return False
+    try:
+        import ctypes
+
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(_target_hwnd):
+            return False
+        user32.SetForegroundWindow(_target_hwnd)
+        time.sleep(0.08)
+        return True
+    except Exception as exc:
+        log.debug("Não foi possível focar janela alvo: %s", exc)
+        return False
+
+
 def _colar_via_atalho() -> None:
     """Simula Ctrl+V (Cmd+V no Darwin/macOS) no campo em foco."""
     controlador = keyboard.Controller()
@@ -836,9 +1237,8 @@ def deliver_text(texto: str) -> None:
     Entrega o texto reconhecido conforme ``OUTPUT_MODE``.
 
     - ``clipboard``: copia com ``pyperclip.copy`` (não digita).
-    - ``type``: digita no foco com ``pynput.keyboard.Controller().type()``;
-      se Unicode/layout falhar (TypeError etc.), copia e cola via Ctrl+V
-      (Cmd+V no macOS).
+    - ``type``: restaura a janela alvo e cola via clipboard + Ctrl+V/Cmd+V
+      (mais confiável que ``Controller.type()`` com acentos PT e WebView).
 
     Texto vazio ou só espaços: registra e retorna sem ação.
     Erros de permissão/clipboard: mensagem em português no log.
@@ -865,19 +1265,14 @@ def deliver_text(texto: str) -> None:
                 OUTPUT_MODE,
             )
 
-        # type: digitar no foco; fallback clipboard + colar se Unicode problemático
-        controlador = keyboard.Controller()
-        try:
-            controlador.type(conteudo)
-            log.info("Texto digitado no foco (%d chars).", len(conteudo))
-        except (TypeError, ValueError, RuntimeError) as exc:
-            log.warning(
-                "Digitação direta falhou (%s); fallback clipboard + colar.",
-                exc,
-            )
-            pyperclip.copy(conteudo)
-            _colar_via_atalho()
-            log.info("Texto colado via atalho (%d chars).", len(conteudo))
+        # type: clipboard + colar. Digitação direta do pynput falha com acentos
+        # PT e costuma ir para o overlay; restaurar foco + Ctrl+V é o caminho
+        # confiável no Windows (e funciona bem nos outros SOs também).
+        pyperclip.copy(conteudo)
+        _focar_janela_alvo()
+        time.sleep(0.05)
+        _colar_via_atalho()
+        log.info("Texto colado no foco via atalho (%d chars).", len(conteudo))
 
     except PermissionError as exc:
         log.error("%s", _mensagem_erro_saida(exc))
@@ -968,9 +1363,14 @@ def _avisar_modelo_no_startup() -> None:
 # Estados possíveis da UI (espelham os estados da hotkey)
 _ui_state: EstadoHotkey = "idle"
 _ui_last_text: str = ""
+_ui_level: float = 0.0  # nível atual do mic (0..1), lido pela UI via get_status
 
 # Referência à janela do PyWebView (para evaluate_js futuramente, na task 3-2)
 _ui_window = None
+
+# Tamanho do overlay compacto (largura, altura). O painel de configurações
+# expande a janela via Api.resize_window("settings").
+_UI_OVERLAY_SIZE = (380, 150)
 
 
 def push_ui() -> None:
@@ -1001,6 +1401,48 @@ def push_ui() -> None:
     except Exception as exc:
         # UI fechada / bridge indisponível: não deve quebrar o pipeline de STT
         log.debug("push_ui ignorado (UI indisponível): %s", exc)
+
+
+def push_live(texto: str) -> None:
+    """Empurra o texto parcial (ao vivo) para o overlay via updateLive(...).
+
+    No-op em modo console (_ui_window is None). Tolera exceções (UI fechada).
+    """
+    # Guarda o parcial para o polling do JS (get_status). No Windows/WebView2,
+    # evaluate_js a partir de thread de fundo nem sempre atualiza a página; o
+    # polling (JS → Python) é o caminho confiável para o preview ao vivo.
+    global _vosk_live_text
+    _vosk_live_text = texto
+    if _ui_window is None:
+        return
+    try:
+        _ui_window.evaluate_js(f"updateLive({json.dumps(texto, ensure_ascii=False)})")
+    except Exception as exc:
+        log.debug("push_live ignorado (UI indisponível): %s", exc)
+
+
+def push_level(pico: float) -> None:
+    """Empurra o nível do microfone (0..1) para o overlay via updateLevel(...)."""
+    global _ui_level
+    _ui_level = float(pico)
+    if _ui_window is None:
+        return
+    try:
+        _ui_window.evaluate_js(f"updateLevel({float(pico):.4f})")
+    except Exception as exc:
+        log.debug("push_level ignorado (UI indisponível): %s", exc)
+
+
+def listar_dispositivos_entrada() -> list:
+    """Lista dispositivos de entrada como [{index, name}] para a UI."""
+    itens = []
+    try:
+        for i, dev in enumerate(sd.query_devices()):
+            if int(dev.get("max_input_channels", 0)) > 0:
+                itens.append({"index": i, "name": str(dev.get("name", f"dispositivo {i}"))})
+    except Exception as exc:
+        log.debug("Falha ao listar dispositivos de entrada: %s", exc)
+    return itens
 
 
 def set_ui_state(state: EstadoHotkey, last_text: Optional[str] = None) -> None:
@@ -1041,12 +1483,18 @@ class Api:
         modelo (_vosk_model/_whisper_model) para forçar recarga sob demanda.
         Retorna {"ok": True} em sucesso ou {"ok": False, "error": "..."} (PT).
         """
-        global _vosk_model, _whisper_model
+        global _vosk_model, _whisper_model, _whisper_force_cpu
 
         if not isinstance(data, dict):
             return {"ok": False, "error": "Configuração inválida: esperado um objeto."}
 
         try:
+            # A UI só envia os campos do formulário; mescla com a config atual
+            # para não perder SAMPLE_RATE / MIN_AUDIO_SECONDS / etc.
+            atual = load_config()
+            atual.update(data)
+            data = atual
+
             # Guarda os valores atuais para detectar mudanças que exigem recarga
             engine_antigo = ENGINE
             whisper_size_antigo = WHISPER_SIZE
@@ -1070,6 +1518,9 @@ class Api:
                 if _whisper_model is not None:
                     _whisper_model = None
                     log.info("Cache do modelo Whisper invalidado (config alterada).")
+                # Troca explícita de DEVICE deve poder tentar CUDA de novo.
+                if DEVICE != device_antigo:
+                    _whisper_force_cpu = False
 
             return {"ok": True}
         except Exception as exc:
@@ -1077,21 +1528,159 @@ class Api:
             return {"ok": False, "error": f"Falha ao salvar configuração: {exc}"}
 
     def get_status(self) -> dict:
-        """Retorna o estado atual da UI, o último texto reconhecido e o ENGINE."""
+        """Retorna o estado atual da UI, o último texto reconhecido e o ENGINE.
+
+        Inclui também 'live' (parcial do streaming Vosk) e 'level' (nível do
+        mic), para o overlay atualizar via polling — mais confiável que
+        evaluate_js entre threads no Windows/WebView2.
+        """
         return {
             "state": _ui_state,
             "last_text": _ui_last_text,
             "engine": ENGINE,
+            "live": _vosk_live_text if _ui_state == "recording" else "",
+            "level": _ui_level if _ui_state == "recording" else 0.0,
         }
+
+    def list_input_devices(self) -> list:
+        """Lista microfones disponíveis ([{index, name}]) para o seletor da UI."""
+        return listar_dispositivos_entrada()
+
+    def resize_window(self, mode: str) -> dict:
+        """
+        Redimensiona a janela conforme o modo pedido pela UI.
+
+        'overlay'  → pill compacto (padrão).
+        'settings' → maior, para caber o painel de configurações.
+        """
+        try:
+            if _ui_window is None:
+                return {"ok": False, "error": "Janela indisponível."}
+            if mode == "settings":
+                _ui_window.resize(440, 560)
+            else:
+                _ui_window.resize(*_UI_OVERLAY_SIZE)
+            return {"ok": True}
+        except Exception as exc:  # janela fechada / backend sem suporte
+            log.debug("resize_window(%s) falhou: %s", mode, exc)
+            return {"ok": False, "error": str(exc)}
+
+    def quit(self) -> dict:
+        """Fecha a janela da UI e encerra o programa."""
+        try:
+            if _ui_window is not None:
+                _ui_window.destroy()
+            return {"ok": True}
+        except Exception as exc:
+            log.error("Falha ao fechar a interface: %s", exc)
+            return {"ok": False, "error": str(exc)}
+
+
+def _hwnd_da_janela_ui(window) -> int:
+    """Obtém o HWND nativo da janela PyWebView (Windows)."""
+    try:
+        native = getattr(window, "native", None)
+        if native is not None and hasattr(native, "Handle"):
+            return int(native.Handle.ToInt32())
+    except Exception:
+        pass
+    try:
+        import ctypes
+
+        return int(ctypes.windll.user32.FindWindowW(None, "Assistente de Voz") or 0)
+    except Exception:
+        return 0
+
+
+def _aplicar_glass_nativo(window) -> None:
+    """
+    Aplica blur Acrylic/Mica nativo no Windows para o fundo translúcido real.
+
+    No Windows 11 tenta DWMWA_SYSTEMBACKDROP_TYPE (Acrylic). No Windows 10
+    (ou se o DWM falhar) usa SetWindowCompositionAttribute com Acrylic.
+    Em outros SOs é no-op (CSS backdrop-filter + transparent cuidam do visual).
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import POINTER, Structure, byref, c_int, c_void_p, sizeof
+    except Exception:
+        return
+
+    # Pequena espera: o HWND só existe de forma estável após o show.
+    time.sleep(0.25)
+    hwnd = _hwnd_da_janela_ui(window)
+    if not hwnd:
+        log.debug("Glass nativo: HWND da UI não encontrado.")
+        return
+
+    # Cantos arredondados (Win11) + tema escuro
+    try:
+        dwm = ctypes.windll.dwmapi
+        DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+        DWMWA_WINDOW_CORNER_PREFERENCE = 33
+        DWMWA_SYSTEMBACKDROP_TYPE = 38
+        DWMWCP_ROUND = 2
+        DWMSBT_TRANSIENT_WINDOW = 3  # Acrylic
+
+        dark = c_int(1)
+        dwm.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, byref(dark), sizeof(dark))
+        corner = c_int(DWMWCP_ROUND)
+        dwm.DwmSetWindowAttribute(
+            hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, byref(corner), sizeof(corner)
+        )
+        backdrop = c_int(DWMSBT_TRANSIENT_WINDOW)
+        hr = dwm.DwmSetWindowAttribute(
+            hwnd, DWMWA_SYSTEMBACKDROP_TYPE, byref(backdrop), sizeof(backdrop)
+        )
+        if hr == 0:
+            log.info("Glass nativo: Acrylic DWM (Windows 11) aplicado.")
+            return
+    except Exception as exc:
+        log.debug("Glass nativo DWM indisponível: %s", exc)
+
+    # Fallback Windows 10: AccentPolicy Acrylic blur behind
+    try:
+
+        class ACCENTPOLICY(Structure):
+            _fields_ = [
+                ("AccentState", c_int),
+                ("AccentFlags", c_int),
+                ("GradientColor", c_int),
+                ("AnimationId", c_int),
+            ]
+
+        class WINCOMPATTRDATA(Structure):
+            _fields_ = [
+                ("Attribute", c_int),
+                ("Data", c_void_p),
+                ("SizeOfData", c_int),
+            ]
+
+        # 0xAABBGGRR — alpha ~0xA0 + tom preto azulado
+        accent = ACCENTPOLICY(4, 2, 0xA00E0E12, 0)
+        data = WINCOMPATTRDATA(
+            19,
+            ctypes.cast(ctypes.pointer(accent), c_void_p),
+            sizeof(accent),
+        )
+        ok = ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, byref(data))
+        if ok:
+            log.info("Glass nativo: Acrylic (AccentPolicy) aplicado.")
+        else:
+            log.debug("Glass nativo: SetWindowCompositionAttribute retornou 0.")
+    except Exception as exc:
+        log.debug("Glass nativo AccentPolicy falhou: %s", exc)
 
 
 def run_ui() -> bool:
     """
     Abre a janela glass do PyWebView apontando para ui/index.html.
 
-    A janela é frameless/transparente/on-top com bridge js_api=Api(). A chamada
-    webview.start() bloqueia até a janela fechar. Retorna True se a UI rodou;
-    False se o PyWebView não estiver disponível (para cair no modo console).
+    Janela frameless, transparente e on-top com bridge js_api=Api(). No Windows
+    aplica Acrylic nativo para o fundo translúcido real. webview.start() bloqueia
+    até fechar. Retorna True se a UI rodou; False se PyWebView indisponível.
     """
     global _ui_window
 
@@ -1109,6 +1698,9 @@ def run_ui() -> bool:
     # Caminho absoluto para o HTML da interface (ao lado deste script)
     html_path = Path(__file__).resolve().parent / "ui" / "index.html"
 
+    # transparent=True: WebView2 com fundo transparente para o glass CSS
+    # (backdrop-filter) e o Acrylic nativo aparecerem. shadow=False evita
+    # artefatos opacos ao redor do pill no Windows.
     _ui_window = webview.create_window(
         "Assistente de Voz",
         url=str(html_path),
@@ -1117,11 +1709,20 @@ def run_ui() -> bool:
         on_top=True,
         easy_drag=True,
         transparent=True,
-        width=380,
-        height=140,
+        shadow=False,
+        vibrancy=True,
+        background_color="#000000",
+        width=_UI_OVERLAY_SIZE[0],
+        height=_UI_OVERLAY_SIZE[1],
         resizable=False,
     )
-    webview.start()
+
+    webview.start(
+        func=lambda w: threading.Thread(
+            target=_aplicar_glass_nativo, args=(w,), name="glass-native", daemon=True
+        ).start(),
+        args=_ui_window,
+    )
     return True
 
 
