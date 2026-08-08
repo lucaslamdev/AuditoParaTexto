@@ -1,0 +1,11 @@
+{
+    "ENGINE": "vosk",
+    "WHISPER_SIZE": "base",
+    "WHISPER_COMPUTE": "int8",
+    "DEVICE": "cpu",
+    "OUTPUT_MODE": "type",
+    "HOTKEY": "Ctrl+Shift+Space",
+    "VOSK_MODEL_PATH": "models/vosk-model-small-pt",
+    "SAMPLE_RATE": 16000,
+    "MIN_AUDIO_SECONDS": 0.3
+}

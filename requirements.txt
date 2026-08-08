@@ -13,3 +13,8 @@ pynput
 pyperclip
 vosk
 faster-whisper
+
+# Interface gráfica (janela glass via PyWebView).
+# No Windows, requer o runtime Microsoft Edge WebView2 instalado
+# (baixe em https://developer.microsoft.com/microsoft-edge/webview2/).
+pywebview

@@ -2,7 +2,9 @@
 
 Captura áudio pelo atalho global, transcreve em português (Vosk ou Whisper) e entrega o texto digitando no foco ou copiando para a área de transferência.
 
-Tudo é offline. A configuração fica no topo de `assistente_voz.py` (seção `CONFIG`). Não há `.env`.
+Tudo é offline. A configuração fica em `config.json` (raiz do projeto), editável pela UI "vidro preto" ou direto no arquivo. Não há `.env`.
+
+`python assistente_voz.py` agora abre a UI (overlay + painel de configurações). Se o PyWebView não estiver disponível, cai automaticamente no modo console (só hotkey).
 
 ## Requisitos
 
@@ -19,6 +21,8 @@ pip install -r requirements.txt
 ```
 
 O default é **CPU**. Whisper (faster-whisper) e Vosk funcionam sem GPU.
+
+O `requirements.txt` já inclui o **`pywebview`** (usado pela UI). No **Windows**, a UI depende do runtime **Microsoft Edge WebView2** — ele costuma já vir instalado no Windows 10/11; se faltar, baixe em https://developer.microsoft.com/microsoft-edge/webview2/. Sem PyWebView/WebView2, o app roda em modo console.
 
 ## 2. GPU NVIDIA / CUDA (opcional)
 
@@ -67,11 +71,11 @@ Se extrair em outro lugar, ajuste `VOSK_MODEL_PATH` para o caminho absoluto (ou 
 
 Whisper baixa o modelo automaticamente na primeira execução (`WHISPER_SIZE`).
 
-## 4. Configuração
+## 4. Configuração (`config.json`)
 
-Edite as constantes no topo de `assistente_voz.py` (`# === CONFIG ===`). Salve e rode de novo.
+O `config.json` na raiz do projeto é a **fonte da verdade**. A UI lê, edita e persiste esse arquivo; se ele não existir, é criado automaticamente com os defaults na primeira execução. Editar direto o `config.json` também funciona — salve e rode de novo.
 
-| Variável | Valores | Default | Função |
+| Chave | Valores | Default | Função |
 |---|---|---|---|
 | `ENGINE` | `vosk` \| `whisper` | `vosk` | Motor de transcrição |
 | `WHISPER_SIZE` | `tiny` \| `base` \| `small` \| `medium` \| `turbo` | `base` | Tamanho do Whisper |
@@ -81,15 +85,22 @@ Edite as constantes no topo de `assistente_voz.py` (`# === CONFIG ===`). Salve e
 | `HOTKEY` | string tipo pynput | `Ctrl+Shift+Space` | Atalho gravar / parar |
 | `VOSK_MODEL_PATH` | caminho local | `models/vosk-model-small-pt` | Pasta do modelo Vosk |
 | `SAMPLE_RATE` | `16000` | `16000` | Taxa de amostragem (Hz); valor fixo recomendado |
+| `MIN_AUDIO_SECONDS` | número positivo | `0.3` | Descarta gravações mais curtas (ruído de toque) |
 
-Exemplos:
+Exemplo de `config.json`:
 
-```python
-ENGINE = "whisper"
-WHISPER_SIZE = "small"
-WHISPER_COMPUTE = "int8"
-OUTPUT_MODE = "clipboard"
-HOTKEY = "Ctrl+Alt+V"
+```json
+{
+    "ENGINE": "whisper",
+    "WHISPER_SIZE": "small",
+    "WHISPER_COMPUTE": "int8",
+    "DEVICE": "cpu",
+    "OUTPUT_MODE": "clipboard",
+    "HOTKEY": "Ctrl+Alt+V",
+    "VOSK_MODEL_PATH": "models/vosk-model-small-pt",
+    "SAMPLE_RATE": 16000,
+    "MIN_AUDIO_SECONDS": 0.3
+}
 ```
 
 `HOTKEY` usa o formato `Ctrl+Shift+Space` (modificadores: Ctrl, Alt, Shift, Cmd/Win).
@@ -128,9 +139,16 @@ O atalho é global (`pynput`). `OUTPUT_MODE = "type"` simula teclado; `"clipboar
 python assistente_voz.py
 ```
 
-Deixe o processo aberto. Ctrl+C encerra.
+Isso abre a UI "vidro preto" (overlay + painel de configurações). Se o PyWebView/WebView2 não estiver disponível, cai no modo console. Deixe o processo aberto; fechar a janela (ou Ctrl+C no console) encerra.
 
-## 7. Uso
+## 7. Interface
+
+A UI tem duas partes:
+
+- **Overlay** (pill compacta, sempre no topo): mostra o **estado** atual — **Ocioso**, **Gravando** ou **Transcrevendo** —, a **engine** ativa (Vosk/Whisper) e o **último texto** transcrito. O estado acompanha a hotkey em tempo real.
+- **Painel de configurações**: o botão **⚙** no overlay abre as configurações. Alterar os campos e **Salvar** grava tudo em `config.json` e aplica na hora (trocar `ENGINE`/tamanho/precisão/dispositivo recarrega o modelo sob demanda). **Fechar** volta ao overlay.
+
+## 8. Uso
 
 1. Foque o campo onde o texto deve ir (se `OUTPUT_MODE = "type"`).
 2. Pressione a hotkey (`Ctrl+Shift+Space` por padrão) → gravação começa.

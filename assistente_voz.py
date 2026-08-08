@@ -10,6 +10,7 @@ Atalho padrão: Ctrl+Shift+Space (toggle gravar / parar + transcrever).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
@@ -46,6 +47,227 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("assistente_voz")
+
+
+# === CONFIG (arquivo config.json) ===
+# Persistência das constantes da seção CONFIG em config.json na raiz do projeto.
+# load_config lê o arquivo; save_config grava validado; apply_config_to_globals
+# aplica os valores às variáveis de módulo. Sem UI/PyWebView nesta etapa.
+
+# Caminho do arquivo de configuração (raiz do projeto, ao lado deste script)
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+
+# Valores válidos por campo (usados na validação; None = sem restrição de conjunto)
+_CONFIG_CHOICES: dict[str, Optional[frozenset[str]]] = {
+    "ENGINE": frozenset({"vosk", "whisper"}),
+    "WHISPER_SIZE": frozenset({"tiny", "base", "small", "medium", "turbo"}),
+    "WHISPER_COMPUTE": frozenset({"int8", "float16", "float32"}),
+    "DEVICE": frozenset({"cpu", "cuda", "auto"}),
+    "OUTPUT_MODE": frozenset({"type", "clipboard"}),
+    "HOTKEY": None,
+    "VOSK_MODEL_PATH": None,
+    "SAMPLE_RATE": None,
+    "MIN_AUDIO_SECONDS": None,
+}
+
+
+def _config_defaults() -> dict:
+    """
+    Retorna os defaults derivados das constantes atuais da seção CONFIG.
+
+    VOSK_MODEL_PATH é devolvido como caminho relativo ("models/vosk-model-small-pt")
+    para não gravar caminho absoluto no config.json.
+    """
+    return {
+        "ENGINE": ENGINE,
+        "WHISPER_SIZE": WHISPER_SIZE,
+        "WHISPER_COMPUTE": WHISPER_COMPUTE,
+        "DEVICE": DEVICE,
+        "OUTPUT_MODE": OUTPUT_MODE,
+        "HOTKEY": HOTKEY,
+        "VOSK_MODEL_PATH": "models/vosk-model-small-pt",
+        "SAMPLE_RATE": SAMPLE_RATE,
+        "MIN_AUDIO_SECONDS": MIN_AUDIO_SECONDS,
+    }
+
+
+def _validar_config(cfg: dict) -> dict:
+    """
+    Valida um dicionário de configuração campo a campo.
+
+    Chaves ausentes recebem o default. Valores inválidos são registrados em
+    português e substituídos pelo default daquele campo. Retorna um novo dict
+    contendo exatamente as chaves conhecidas.
+    """
+    defaults = _config_defaults()
+    validado: dict = {}
+
+    for chave, padrao in defaults.items():
+        if chave not in cfg:
+            log.warning("Config: chave ausente '%s'; usando default %r.", chave, padrao)
+            validado[chave] = padrao
+            continue
+
+        valor = cfg[chave]
+        opcoes = _CONFIG_CHOICES.get(chave)
+
+        # Campos com conjunto fechado de opções (ENGINE, WHISPER_SIZE, etc.)
+        if opcoes is not None:
+            texto = str(valor).strip().lower()
+            if texto not in opcoes:
+                log.warning(
+                    "Config: valor inválido para '%s' (%r); usando default %r. Válidos: %s.",
+                    chave,
+                    valor,
+                    padrao,
+                    ", ".join(sorted(opcoes)),
+                )
+                validado[chave] = padrao
+            else:
+                validado[chave] = texto
+            continue
+
+        # SAMPLE_RATE: inteiro positivo
+        if chave == "SAMPLE_RATE":
+            try:
+                inteiro = int(valor)
+                if inteiro <= 0:
+                    raise ValueError("deve ser positivo")
+                validado[chave] = inteiro
+            except (TypeError, ValueError):
+                log.warning(
+                    "Config: valor inválido para 'SAMPLE_RATE' (%r); usando default %r.",
+                    valor,
+                    padrao,
+                )
+                validado[chave] = padrao
+            continue
+
+        # MIN_AUDIO_SECONDS: número positivo
+        if chave == "MIN_AUDIO_SECONDS":
+            try:
+                numero = float(valor)
+                if numero <= 0:
+                    raise ValueError("deve ser positivo")
+                validado[chave] = numero
+            except (TypeError, ValueError):
+                log.warning(
+                    "Config: valor inválido para 'MIN_AUDIO_SECONDS' (%r); usando default %r.",
+                    valor,
+                    padrao,
+                )
+                validado[chave] = padrao
+            continue
+
+        # HOTKEY / VOSK_MODEL_PATH: string não vazia
+        texto = str(valor).strip()
+        if not texto:
+            log.warning(
+                "Config: valor vazio para '%s'; usando default %r.", chave, padrao
+            )
+            validado[chave] = padrao
+        else:
+            validado[chave] = texto
+
+    return validado
+
+
+def load_config() -> dict:
+    """
+    Lê config.json e retorna um dicionário validado.
+
+    Se o arquivo não existir, retorna os defaults derivados das constantes atuais.
+    Erros de leitura/JSON são registrados em português e recaem nos defaults.
+    """
+    if not CONFIG_PATH.is_file():
+        log.info("config.json ausente; usando defaults derivados das constantes.")
+        return _config_defaults()
+
+    try:
+        with CONFIG_PATH.open("r", encoding="utf-8") as arquivo:
+            dados = json.load(arquivo)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.error(
+            "Falha ao ler config.json (%s); usando defaults derivados das constantes.",
+            exc,
+        )
+        return _config_defaults()
+
+    if not isinstance(dados, dict):
+        log.error("config.json não contém um objeto JSON; usando defaults.")
+        return _config_defaults()
+
+    return _validar_config(dados)
+
+
+def save_config(cfg: dict) -> None:
+    """
+    Valida ``cfg`` e grava em config.json (JSON indentado, UTF-8).
+
+    Chaves/valores são validados antes de gravar (via _validar_config), de modo
+    que o arquivo resultante contém apenas chaves conhecidas e valores válidos.
+    """
+    validado = _validar_config(cfg)
+    try:
+        with CONFIG_PATH.open("w", encoding="utf-8") as arquivo:
+            json.dump(validado, arquivo, indent=4, ensure_ascii=False)
+            arquivo.write("\n")
+        log.info("Configuração gravada em %s", CONFIG_PATH)
+    except OSError as exc:
+        log.error("Falha ao gravar config.json (%s).", exc)
+
+
+def apply_config_to_globals(cfg: dict) -> None:
+    """
+    Aplica os valores de ``cfg`` às variáveis de módulo da seção CONFIG.
+
+    Atualiza ENGINE, WHISPER_SIZE, WHISPER_COMPUTE, DEVICE, OUTPUT_MODE, HOTKEY,
+    VOSK_MODEL_PATH, SAMPLE_RATE e MIN_AUDIO_SECONDS. Caminhos relativos de
+    VOSK_MODEL_PATH são resolvidos em relação à pasta do script.
+    """
+    global ENGINE, WHISPER_SIZE, WHISPER_COMPUTE, DEVICE, OUTPUT_MODE
+    global HOTKEY, VOSK_MODEL_PATH, SAMPLE_RATE, MIN_AUDIO_SECONDS
+
+    validado = _validar_config(cfg)
+
+    ENGINE = validado["ENGINE"]
+    WHISPER_SIZE = validado["WHISPER_SIZE"]
+    WHISPER_COMPUTE = validado["WHISPER_COMPUTE"]
+    DEVICE = validado["DEVICE"]
+    OUTPUT_MODE = validado["OUTPUT_MODE"]
+    HOTKEY = validado["HOTKEY"]
+    SAMPLE_RATE = int(validado["SAMPLE_RATE"])
+    MIN_AUDIO_SECONDS = float(validado["MIN_AUDIO_SECONDS"])
+
+    # Resolve caminho relativo do modelo Vosk contra a pasta do script
+    caminho_modelo = Path(validado["VOSK_MODEL_PATH"])
+    if not caminho_modelo.is_absolute():
+        caminho_modelo = Path(__file__).resolve().parent / caminho_modelo
+    VOSK_MODEL_PATH = str(caminho_modelo)
+
+    log.info(
+        "Config aplicada | ENGINE=%s DEVICE=%s OUTPUT_MODE=%s HOTKEY=%s SAMPLE_RATE=%s",
+        ENGINE,
+        DEVICE,
+        OUTPUT_MODE,
+        HOTKEY,
+        SAMPLE_RATE,
+    )
+
+
+def _inicializar_config() -> None:
+    """
+    Prepara a configuração no startup, antes de áudio/hotkey.
+
+    Se config.json não existir, cria-o com os defaults. Caso exista, carrega e
+    aplica os valores às variáveis de módulo via apply_config_to_globals.
+    """
+    if not CONFIG_PATH.is_file():
+        log.info("config.json não encontrado; criando com defaults.")
+        save_config(_config_defaults())
+        apply_config_to_globals(_config_defaults())
+    else:
+        apply_config_to_globals(load_config())
 
 
 # === ÁUDIO ===
@@ -288,6 +510,8 @@ def _pipeline_apos_parar() -> None:
     """
     print("[TRANSCRAVENDO]", flush=True)
     log.info("[TRANSCRAVENDO] processando áudio (ENGINE=%s)...", ENGINE)
+    # Estado da UI: começou a transcrever (parou de gravar)
+    set_ui_state("transcribing")
     try:
         audio = stop_recording()
         if audio is None:
@@ -318,6 +542,8 @@ def _pipeline_apos_parar() -> None:
             len(texto),
         )
         deliver_text(texto)
+        # UI: entregou o texto → volta para idle exibindo o último reconhecido
+        set_ui_state("idle", last_text=texto)
     except RuntimeError as exc:
         # modelo ausente, ENGINE inválido, CUDA/CPU falhou, etc.
         log.error("%s", exc)
@@ -325,6 +551,8 @@ def _pipeline_apos_parar() -> None:
         log.error("Falha no pipeline pós-gravação: %s", exc)
     finally:
         _set_estado("idle")
+        # Garante UI em idle mesmo nos caminhos de erro/áudio vazio (sem tocar last_text)
+        set_ui_state("idle")
         log.info("Estado: idle (pronto para nova gravação).")
 
 
@@ -355,8 +583,12 @@ def _on_hotkey() -> None:
             start_recording()
         except Exception as exc:
             _set_estado("idle")
+            # UI: falha ao iniciar mic → mantém idle
+            set_ui_state("idle")
             log.error("Não foi possível iniciar gravação: %s", exc)
             return
+        # UI: gravação iniciada
+        set_ui_state("recording")
         print("[REC]", flush=True)
         log.info("[REC] gravação ativa — pressione %s de novo para parar.", HOTKEY)
         return
@@ -726,6 +958,173 @@ def _avisar_modelo_no_startup() -> None:
         )
 
 
+# === UI (PyWebView) ===
+# Janela "glass" (frameless/transparente) que fala com o JS via bridge js_api.
+# A classe Api expõe get_config/save_config/get_status ao front-end (ui/app.js).
+# O estado da UI (_ui_state/_ui_last_text) é mantido em variáveis de módulo; o
+# envio de eventos para o JS (evaluate_js) fica na próxima task (3-2) — aqui só
+# criamos o mecanismo e fazemos get_status refletir esse estado.
+
+# Estados possíveis da UI (espelham os estados da hotkey)
+_ui_state: EstadoHotkey = "idle"
+_ui_last_text: str = ""
+
+# Referência à janela do PyWebView (para evaluate_js futuramente, na task 3-2)
+_ui_window = None
+
+
+def push_ui() -> None:
+    """
+    Empurra o estado atual para o front-end via evaluate_js (updateStatus).
+
+    Só faz algo quando há janela PyWebView (_ui_window). Em modo console
+    (_ui_window is None) é um no-op — sem dependência forte com a UI.
+
+    O payload {state, last_text, engine} é serializado com json.dumps para
+    escapar aspas/acentos e virar um objeto JS válido. Chamável de outra thread
+    (pywebview suporta evaluate_js entre threads); exceções são toleradas
+    (por exemplo, janela já fechada).
+    """
+    if _ui_window is None:
+        return
+    try:
+        payload = json.dumps(
+            {
+                "state": _ui_state,
+                "last_text": _ui_last_text,
+                "engine": ENGINE,
+            },
+            ensure_ascii=False,
+        )
+        # json.dumps gera um literal de objeto JS válido para updateStatus(...)
+        _ui_window.evaluate_js(f"updateStatus({payload})")
+    except Exception as exc:
+        # UI fechada / bridge indisponível: não deve quebrar o pipeline de STT
+        log.debug("push_ui ignorado (UI indisponível): %s", exc)
+
+
+def set_ui_state(state: EstadoHotkey, last_text: Optional[str] = None) -> None:
+    """
+    Atualiza o estado de UI de módulo (_ui_state) e, opcionalmente, o último texto,
+    e dispara push_ui() para refletir a mudança no front-end em tempo real.
+
+    Em modo console (_ui_window is None) apenas atualiza as variáveis; push_ui()
+    é no-op nesse caso.
+    """
+    global _ui_state, _ui_last_text
+    _ui_state = state
+    if last_text is not None:
+        _ui_last_text = last_text
+    # Reflete o novo estado na UI (no-op se estiver em modo console)
+    push_ui()
+
+
+class Api:
+    """
+    Ponte (bridge) exposta ao JavaScript pela janela PyWebView (js_api).
+
+    Métodos:
+        get_config()  → configuração efetiva atual (dict validado).
+        save_config() → valida, grava, aplica e invalida caches de modelo.
+        get_status()  → estado atual da UI, último texto e ENGINE.
+    """
+
+    def get_config(self) -> dict:
+        """Retorna a configuração efetiva atual (lida/validada de config.json)."""
+        return load_config()
+
+    def save_config(self, data: dict) -> dict:
+        """
+        Valida e grava a nova configuração, aplica às globais e invalida caches.
+
+        Se ENGINE/WHISPER_SIZE/WHISPER_COMPUTE/DEVICE mudarem, zera os caches de
+        modelo (_vosk_model/_whisper_model) para forçar recarga sob demanda.
+        Retorna {"ok": True} em sucesso ou {"ok": False, "error": "..."} (PT).
+        """
+        global _vosk_model, _whisper_model
+
+        if not isinstance(data, dict):
+            return {"ok": False, "error": "Configuração inválida: esperado um objeto."}
+
+        try:
+            # Guarda os valores atuais para detectar mudanças que exigem recarga
+            engine_antigo = ENGINE
+            whisper_size_antigo = WHISPER_SIZE
+            whisper_compute_antigo = WHISPER_COMPUTE
+            device_antigo = DEVICE
+
+            # Grava (validado) e aplica às variáveis de módulo
+            save_config(data)
+            apply_config_to_globals(data)
+
+            # Invalida caches se algo que afeta o modelo mudou
+            if (
+                ENGINE != engine_antigo
+                or WHISPER_SIZE != whisper_size_antigo
+                or WHISPER_COMPUTE != whisper_compute_antigo
+                or DEVICE != device_antigo
+            ):
+                if _vosk_model is not None:
+                    _vosk_model = None
+                    log.info("Cache do modelo Vosk invalidado (config alterada).")
+                if _whisper_model is not None:
+                    _whisper_model = None
+                    log.info("Cache do modelo Whisper invalidado (config alterada).")
+
+            return {"ok": True}
+        except Exception as exc:
+            log.error("Falha ao salvar configuração via UI: %s", exc)
+            return {"ok": False, "error": f"Falha ao salvar configuração: {exc}"}
+
+    def get_status(self) -> dict:
+        """Retorna o estado atual da UI, o último texto reconhecido e o ENGINE."""
+        return {
+            "state": _ui_state,
+            "last_text": _ui_last_text,
+            "engine": ENGINE,
+        }
+
+
+def run_ui() -> bool:
+    """
+    Abre a janela glass do PyWebView apontando para ui/index.html.
+
+    A janela é frameless/transparente/on-top com bridge js_api=Api(). A chamada
+    webview.start() bloqueia até a janela fechar. Retorna True se a UI rodou;
+    False se o PyWebView não estiver disponível (para cair no modo console).
+    """
+    global _ui_window
+
+    try:
+        import webview
+    except ImportError:
+        log.warning(
+            "PyWebView não está instalado — usando o modo console. "
+            "Para a interface gráfica, instale as dependências "
+            "(pip install pywebview) e, no Windows, o runtime Microsoft Edge "
+            "WebView2 (https://developer.microsoft.com/microsoft-edge/webview2/)."
+        )
+        return False
+
+    # Caminho absoluto para o HTML da interface (ao lado deste script)
+    html_path = Path(__file__).resolve().parent / "ui" / "index.html"
+
+    _ui_window = webview.create_window(
+        "Assistente de Voz",
+        url=str(html_path),
+        js_api=Api(),
+        frameless=True,
+        on_top=True,
+        easy_drag=True,
+        transparent=True,
+        width=380,
+        height=140,
+        resizable=False,
+    )
+    webview.start()
+    return True
+
+
 def main() -> None:
     """
     Ponto de entrada: ``python assistente_voz.py``
@@ -739,6 +1138,9 @@ def main() -> None:
         idle → [REC] gravação → [STOP] → [TRANSCRAVENDO]
         → transcribe(ENGINE) → deliver_text(OUTPUT_MODE) → idle
     """
+    # Prepara a configuração ANTES de listar dispositivos/registrar hotkey.
+    _inicializar_config()
+
     engine = (ENGINE or "").strip().lower()
     if engine not in ("vosk", "whisper"):
         log.error(
@@ -764,15 +1166,21 @@ def main() -> None:
 
     listar_dispositivos_audio()
     _avisar_modelo_no_startup()
+    # A hotkey global roda em thread daemon do pynput e continua ativa
+    # enquanto a janela da UI estiver aberta (run_ui bloqueia a thread principal).
     listener = configurar_hotkey()
 
-    print(f"Aguardando hotkey ({HOTKEY})... [idle]", flush=True)
-    log.info("Aguardando hotkey... (%s). Ctrl+C para sair.", HOTKEY)
-
     try:
-        # Mantém o processo vivo enquanto o listener pynput roda em background
-        while listener.running:
-            time.sleep(0.5)
+        # Tenta abrir a interface gráfica; run_ui() bloqueia até a janela fechar.
+        if run_ui():
+            log.info("Interface gráfica encerrada.")
+        else:
+            # PyWebView indisponível: mantém o comportamento antigo (console).
+            print(f"Aguardando hotkey ({HOTKEY})... [idle]", flush=True)
+            log.info("Aguardando hotkey... (%s). Ctrl+C para sair.", HOTKEY)
+            # Mantém o processo vivo enquanto o listener pynput roda em background
+            while listener.running:
+                time.sleep(0.5)
     except KeyboardInterrupt:
         log.info("Encerrado pelo usuário (Ctrl+C).")
     finally:

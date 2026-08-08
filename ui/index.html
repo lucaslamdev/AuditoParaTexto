@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Assistente de Voz</title>
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Overlay compacto (pill) -->
+  <div id="overlay" class="state-idle">
+    <div class="overlay-row">
+      <div class="overlay-status">
+        <span id="status-dot" class="dot"></span>
+        <span id="status-label">idle</span>
+        <span id="engine" class="engine-tag">—</span>
+      </div>
+      <button id="btn-settings" class="icon-btn" type="button" title="Configurações" aria-label="Configurações">⚙</button>
+    </div>
+    <div id="last-text" class="last-text"></div>
+  </div>
+
+  <!-- Drawer de configurações -->
+  <div id="settings" class="drawer" hidden>
+    <div class="drawer-header">
+      <h2>Configurações</h2>
+    </div>
+    <form id="settings-form">
+      <label>
+        ENGINE
+        <select name="ENGINE" id="field-engine">
+          <option value="whisper">whisper</option>
+          <option value="vosk">vosk</option>
+        </select>
+      </label>
+
+      <label>
+        WHISPER_SIZE
+        <select name="WHISPER_SIZE" id="field-whisper-size">
+          <option value="tiny">tiny</option>
+          <option value="base">base</option>
+          <option value="small">small</option>
+          <option value="medium">medium</option>
+          <option value="turbo">turbo</option>
+        </select>
+      </label>
+
+      <label>
+        WHISPER_COMPUTE
+        <select name="WHISPER_COMPUTE" id="field-whisper-compute">
+          <option value="int8">int8</option>
+          <option value="float16">float16</option>
+          <option value="float32">float32</option>
+        </select>
+      </label>
+
+      <label>
+        DEVICE
+        <select name="DEVICE" id="field-device">
+          <option value="cpu">cpu</option>
+          <option value="cuda">cuda</option>
+          <option value="auto">auto</option>
+        </select>
+      </label>
+
+      <label>
+        OUTPUT_MODE
+        <select name="OUTPUT_MODE" id="field-output-mode">
+          <option value="type">type</option>
+          <option value="clipboard">clipboard</option>
+        </select>
+      </label>
+
+      <label>
+        HOTKEY
+        <input type="text" name="HOTKEY" id="field-hotkey" placeholder="ex: ctrl+alt+space">
+      </label>
+
+      <label>
+        VOSK_MODEL_PATH
+        <input type="text" name="VOSK_MODEL_PATH" id="field-vosk-path" placeholder="caminho do modelo vosk">
+      </label>
+
+      <div class="actions">
+        <button id="btn-close" class="btn btn-ghost" type="button">Fechar</button>
+        <button id="btn-save" class="btn btn-primary" type="submit">Salvar</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
