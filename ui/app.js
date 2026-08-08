@@ -25,12 +25,44 @@ const CAMPOS_CONFIG = [
 
 const MOCK_KEY = "voz_config";
 let _pollTimer = null;
+let _settingsOpen = false;
+let _lastOverlaySize = { w: 380, h: 120 };
+let _fitTimer = null;
 
 // ---- Estado visual -----------------------------------------------------
 
 // Atalho: define apenas o estado.
 function setStatus(state) {
   updateStatus({ state });
+}
+
+// Expande a janela conforme o texto da transcrição (só no modo overlay).
+function fitOverlayToTranscript() {
+  if (_settingsOpen) return;
+  const texto = (document.getElementById("last-text") || {}).textContent || "";
+  const chars = texto.trim().length;
+  // Largura: cresce com linhas longas; altura: com quebras / volume de texto.
+  const approxCols = 36;
+  const lines = chars === 0 ? 1 : Math.max(1, Math.ceil(chars / approxCols));
+  const lineH = 19;
+  const chromeH = 52; // status inferior + paddings + chrome
+  const w = Math.min(560, Math.max(360, 300 + Math.min(chars, 120) * 1.6));
+  const h = Math.min(360, Math.max(112, chromeH + lines * lineH + (chars > 0 ? 12 : 0)));
+  const wi = Math.round(w);
+  const hi = Math.round(h);
+  if (Math.abs(wi - _lastOverlaySize.w) < 8 && Math.abs(hi - _lastOverlaySize.h) < 6) {
+    return;
+  }
+  _lastOverlaySize = { w: wi, h: hi };
+  if (!(temApi() && window.pywebview.api.resize_overlay)) return;
+  try {
+    window.pywebview.api.resize_overlay(wi, hi);
+  } catch (e) {}
+}
+
+function scheduleFitOverlay() {
+  clearTimeout(_fitTimer);
+  _fitTimer = setTimeout(fitOverlayToTranscript, 60);
 }
 
 // Atualiza a UI a partir do payload do motor: {state, last_text, engine}.
@@ -60,19 +92,19 @@ function updateStatus(payload) {
       } else if (payload.last_text) {
         lastText.textContent = payload.last_text;
       }
-      // se live/last_text vazios, mantém o que já está no overlay
     } else if (payload.last_text !== undefined) {
       lastText.textContent = payload.last_text || "";
     }
   }
-  // Nível do microfone também via polling (mais confiável que evaluate_js).
   if (payload.level !== undefined) updateLevel(payload.level);
+  scheduleFitOverlay();
 }
 
 // Mostra o texto parcial ao vivo (streaming) no overlay enquanto grava.
 function updateLive(texto) {
   const lastText = document.getElementById("last-text");
   if (lastText) lastText.textContent = texto || "";
+  scheduleFitOverlay();
 }
 
 // Atualiza o medidor de nível do microfone (pico 0..1).
@@ -193,6 +225,7 @@ async function openSettings() {
   await popularMicrofones(cfg.INPUT_DEVICE);
   preencherForm(cfg);
   atualizarCamposPorEngine();
+  _settingsOpen = true;
   // Expande a janela para caber o painel (transparência não é confiável no Windows).
   if (temApi() && window.pywebview.api.resize_window) {
     try {
@@ -206,12 +239,15 @@ async function openSettings() {
 function closeSettings() {
   const el = document.getElementById("settings");
   if (el) el.hidden = true;
+  _settingsOpen = false;
+  _lastOverlaySize = { w: 0, h: 0 };
   // Volta ao tamanho compacto do overlay.
   if (temApi() && window.pywebview.api.resize_window) {
     try {
       window.pywebview.api.resize_window("overlay");
     } catch (e) {}
   }
+  scheduleFitOverlay();
 }
 
 // ---- Toast -------------------------------------------------------------

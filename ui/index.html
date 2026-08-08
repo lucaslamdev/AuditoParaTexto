@@ -14,15 +14,15 @@
       <button id="btn-settings" class="icon-btn" type="button" title="Configurações" aria-label="Configurações">⚙</button>
       <button id="btn-quit" class="icon-btn quit-btn" type="button" title="Fechar" aria-label="Fechar">×</button>
     </div>
-    <div class="overlay-row">
+    <div id="last-text" class="transcript" aria-live="polite"></div>
+    <div class="overlay-footer">
       <div class="overlay-status">
         <span id="status-dot" class="dot"></span>
         <span id="status-label">idle</span>
         <span id="engine" class="engine-tag">—</span>
       </div>
+      <div class="level" aria-hidden="true"><div id="level-bar"></div></div>
     </div>
-    <div class="level" aria-hidden="true"><div id="level-bar"></div></div>
-    <div id="last-text" class="last-text"></div>
   </div>
 
   <!-- Drawer de configurações -->

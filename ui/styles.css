@@ -68,16 +68,15 @@ body {
 #overlay {
   position: fixed;
   inset: 0;
-  padding: 12px 14px 14px;
+  padding: 10px 14px 10px;
   display: flex;
   flex-direction: column;
-  justify-content: center;
-  gap: 8px;
+  justify-content: stretch;
+  gap: 6px;
 
   background: var(--glass-fill);
   -webkit-backdrop-filter: blur(var(--blur)) saturate(170%);
   backdrop-filter: blur(var(--blur)) saturate(170%);
-  /* Borda interna suave — evita “degrau” nos cantos com o clip do DWM */
   border: 1px solid var(--border);
   border-radius: var(--radius);
   box-shadow: var(--shadow);
@@ -97,18 +96,37 @@ body {
   gap: 2px;
 }
 
-#overlay > *:not(.window-chrome) {
-  position: relative;
-  z-index: 1;
+/* Transcrição centralizada — a janela cresce com o texto */
+.transcript {
+  flex: 1 1 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--text);
+  line-height: 1.35;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: hidden;
+  padding: 18px 40px 6px 12px;
+  min-height: 36px;
 }
 
-.overlay-row {
+.transcript:empty::before {
+  content: "";
+}
+
+/* Rodapé: status no canto inferior esquerdo + nível */
+.overlay-footer {
+  flex: 0 0 auto;
   display: flex;
   align-items: center;
   justify-content: flex-start;
   gap: 10px;
-  /* reserva espaço para o chrome (⚙ + ×) no canto direito */
-  padding-right: 64px;
+  min-height: 22px;
+  padding-right: 4px;
 }
 
 .overlay-status {
@@ -129,26 +147,26 @@ body {
 }
 
 #status-label {
-  font-size: 13px;
+  font-size: 12px;
   font-weight: 600;
   letter-spacing: 0.01em;
-  color: var(--text);
+  color: var(--muted);
   text-transform: capitalize;
   white-space: nowrap;
 }
 
 .engine-tag {
-  font-size: 11px;
+  font-size: 10px;
   font-weight: 500;
   color: var(--muted);
-  padding: 2px 8px;
+  padding: 1px 7px;
   border: 1px solid var(--border-soft);
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.04);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
-  max-width: 120px;
+  max-width: 100px;
 }
 
 .icon-btn {
@@ -192,7 +210,9 @@ body {
 }
 
 .level {
-  height: 4px;
+  height: 3px;
+  width: 56px;
+  flex: 0 0 auto;
   border-radius: 999px;
   background: rgba(255, 255, 255, 0.08);
   overflow: hidden;
@@ -210,24 +230,6 @@ body {
 
 #overlay:not(.state-recording) .level {
   visibility: hidden;
-}
-
-.last-text {
-  font-size: 12px;
-  color: var(--muted);
-  white-space: normal;
-  overflow: hidden;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-height: 1.25;
-  min-height: 15px;
-  max-height: 2.8em;
-  word-break: break-word;
-}
-
-.last-text:empty {
-  display: none;
 }
 
 /* ============================================================

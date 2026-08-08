@@ -590,15 +590,22 @@ def _pipeline_apos_parar() -> None:
                 whisper_stream_finish()
             return
 
+        # Snapshot do modo na entrega (evita corrida se a UI mudar no meio).
+        modo_entrega = (OUTPUT_MODE or "type").strip().lower()
+
         # Vosk em streaming: usa o texto já reconhecido ao vivo (evita reprocessar).
         if vosk_stream_ativo():
             texto = vosk_stream_finish()
         else:
-            # Whisper: encerra preview/warm e reutiliza pass paralelo se fresco.
             if whisper_stream_ativo():
                 whisper_stream_finish()
             if (ENGINE or "").strip().lower() == "whisper":
-                texto = whisper_final_rapido(audio)
+                # type: pode reutilizar warm paralelo (rápido).
+                # clipboard: SEMPRE aguarda a transcrição final completa antes de copiar.
+                if modo_entrega == "clipboard":
+                    texto = transcribe_whisper(audio, rapido=False)
+                else:
+                    texto = whisper_final_rapido(audio)
             else:
                 texto = transcribe(audio)
         if not texto or not str(texto).strip():
@@ -607,13 +614,13 @@ def _pipeline_apos_parar() -> None:
 
         log.info(
             "Entregando texto via OUTPUT_MODE=%s (%d chars).",
-            OUTPUT_MODE,
+            modo_entrega,
             len(texto),
         )
         # Mostra o texto final no overlay ANTES da entrega (clipboard/type).
         set_ui_state("transcribing", last_text=texto)
         push_live(texto)
-        deliver_text(texto)
+        deliver_text(texto, modo=modo_entrega)
         # UI: entregou o texto → idle com o último reconhecido no overlay
         set_ui_state("idle", last_text=texto)
     except RuntimeError as exc:
@@ -664,9 +671,9 @@ def _on_hotkey() -> None:
             iniciar = False
 
     if iniciar:
-        # Guarda a janela em foco (onde o usuário quer o texto) antes do overlay
-        # ou de qualquer outra coisa roubar o foreground.
-        _capturar_janela_alvo()
+        # Só captura a janela-alvo no modo type (clipboard nunca cola/foca).
+        if (OUTPUT_MODE or "").strip().lower() != "clipboard":
+            _capturar_janela_alvo()
         # Ativa a transcrição ao vivo conforme o ENGINE (best-effort). Vosk usa
         # streaming nativo; Whisper usa re-transcrição periódica (pseudo-stream).
         engine_atual = (ENGINE or "").strip().lower()
@@ -699,8 +706,9 @@ def _on_hotkey() -> None:
         log.info("[REC] gravação ativa — pressione %s de novo para parar.", HOTKEY)
         return
 
-    # Recaptura o alvo no STOP (usuário ainda deve estar no editor).
-    _capturar_janela_alvo()
+    # Recaptura o alvo no STOP apenas no modo type.
+    if (OUTPUT_MODE or "").strip().lower() != "clipboard":
+        _capturar_janela_alvo()
     print("[STOP]", flush=True)
     log.info("[STOP] encerrando gravação e disparando transcrição...")
     threading.Thread(
@@ -935,6 +943,7 @@ def vosk_stream_ativo() -> bool:
 _whisper_model = None  # cache do faster_whisper.WhisperModel (carregado sob demanda)
 _whisper_device = None  # dispositivo efetivamente usado ("cpu"/"cuda") p/ fallback
 _whisper_lock = threading.Lock()  # serializa load/transcribe (preview + final)
+_whisper_load_lock = threading.Lock()  # serializa o CARREGAMENTO (evita download triplo)
 _whisper_force_cpu = False  # grudento: após falha de CUDA/cuBLAS, fica em CPU
 
 _WHISPER_SIZES = frozenset({"tiny", "base", "small", "medium", "turbo"})
@@ -957,83 +966,96 @@ def load_whisper_model(force_cpu: bool = False):
         log.debug("Modelo Whisper já em memória (cache).")
         return _whisper_model
 
-    # Grudento: se o cuBLAS/CUDA já falhou nesta sessão, sempre usa CPU (evita
-    # reabrir a mesma falha e o thrashing entre auto↔cpu).
-    if _whisper_force_cpu:
-        force_cpu = True
+    # Serializa o CARREGAMENTO: sem este lock, preload + preview + warm podem
+    # disparar download/carga do mesmo modelo em paralelo (triplicando a espera
+    # na primeira gravação e o uso de RAM).
+    with _whisper_load_lock:
+        # Re-checa o cache DENTRO do lock: quem esperava aqui não precisa carregar.
+        if _whisper_model is not None and not force_cpu:
+            log.debug("Modelo Whisper já carregado por outra thread (após lock).")
+            return _whisper_model
 
-    from faster_whisper import WhisperModel
+        # Grudento: se o cuBLAS/CUDA já falhou nesta sessão, sempre usa CPU (evita
+        # reabrir a mesma falha e o thrashing entre auto↔cpu).
+        if _whisper_force_cpu:
+            force_cpu = True
 
-    size = (WHISPER_SIZE or "base").strip().lower()
-    if size not in _WHISPER_SIZES:
-        log.warning(
-            "WHISPER_SIZE=%r inválido; usando 'base'. Válidos: %s.",
-            WHISPER_SIZE,
-            ", ".join(sorted(_WHISPER_SIZES)),
-        )
-        size = "base"
+        from faster_whisper import WhisperModel
 
-    compute = (WHISPER_COMPUTE or "int8").strip().lower()
-    if compute not in _WHISPER_COMPUTE_TYPES:
-        log.warning(
-            "WHISPER_COMPUTE=%r inválido; usando 'int8'. Válidos: %s.",
-            WHISPER_COMPUTE,
-            ", ".join(sorted(_WHISPER_COMPUTE_TYPES)),
-        )
-        compute = "int8"
-
-    device = (DEVICE or "auto").strip().lower()
-    if device not in _WHISPER_DEVICES:
-        log.warning(
-            "DEVICE=%r inválido; usando 'auto'. Válidos: %s.",
-            DEVICE,
-            ", ".join(sorted(_WHISPER_DEVICES)),
-        )
-        device = "auto"
-
-    # float16 não é suportado em CPU pelo ctranslate2 → cai para int8
-    if force_cpu:
-        device = "cpu"
-    if device == "cpu" and compute == "float16":
-        log.info("float16 não é suportado em CPU; usando int8.")
-        compute = "int8"
-
-    log.info(
-        "Lazy-load: carregando modelo Whisper pela primeira vez "
-        "(size=%s device=%s compute_type=%s)",
-        size,
-        device,
-        compute,
-    )
-    try:
-        _whisper_model = WhisperModel(size, device=device, compute_type=compute)
-        _whisper_device = device
-    except Exception as exc:
-        if device in ("cuda", "auto"):
+        size = (WHISPER_SIZE or "base").strip().lower()
+        if size not in _WHISPER_SIZES:
             log.warning(
-                "Falha ao usar dispositivo '%s' para Whisper (%s). "
-                "Alternando para CPU.",
-                device,
-                exc,
+                "WHISPER_SIZE=%r inválido; usando 'base'. Válidos: %s.",
+                WHISPER_SIZE,
+                ", ".join(sorted(_WHISPER_SIZES)),
             )
-            compute_cpu = "int8" if compute == "float16" else compute
-            try:
-                _whisper_model = WhisperModel(size, device="cpu", compute_type=compute_cpu)
-                _whisper_device = "cpu"
-                _whisper_force_cpu = True  # não tenta CUDA de novo nesta sessão
-            except Exception as exc_cpu:
-                raise RuntimeError(
-                    f"Falha ao carregar Whisper mesmo em CPU ({exc_cpu}). "
-                    "Verifique faster-whisper/ctranslate2 e o tamanho do modelo."
-                ) from exc_cpu
-        else:
-            raise RuntimeError(
-                f"Falha ao carregar Whisper em CPU ({exc}). "
-                "Verifique faster-whisper/ctranslate2 e o tamanho do modelo."
-            ) from exc
+            size = "base"
 
-    log.info("Modelo Whisper carregado e em cache (size=%s, device=%s).", size, _whisper_device)
-    return _whisper_model
+        compute = (WHISPER_COMPUTE or "int8").strip().lower()
+        if compute not in _WHISPER_COMPUTE_TYPES:
+            log.warning(
+                "WHISPER_COMPUTE=%r inválido; usando 'int8'. Válidos: %s.",
+                WHISPER_COMPUTE,
+                ", ".join(sorted(_WHISPER_COMPUTE_TYPES)),
+            )
+            compute = "int8"
+
+        device = (DEVICE or "auto").strip().lower()
+        if device not in _WHISPER_DEVICES:
+            log.warning(
+                "DEVICE=%r inválido; usando 'auto'. Válidos: %s.",
+                DEVICE,
+                ", ".join(sorted(_WHISPER_DEVICES)),
+            )
+            device = "auto"
+
+        # float16 não é suportado em CPU pelo ctranslate2 → cai para int8
+        if force_cpu:
+            device = "cpu"
+        if device == "cpu" and compute == "float16":
+            log.info("float16 não é suportado em CPU; usando int8.")
+            compute = "int8"
+
+        log.info(
+            "Lazy-load: carregando modelo Whisper pela primeira vez "
+            "(size=%s device=%s compute_type=%s)",
+            size,
+            device,
+            compute,
+        )
+        try:
+            _whisper_model = WhisperModel(size, device=device, compute_type=compute)
+            _whisper_device = device
+        except Exception as exc:
+            if device in ("cuda", "auto"):
+                log.warning(
+                    "Falha ao usar dispositivo '%s' para Whisper (%s). "
+                    "Alternando para CPU.",
+                    device,
+                    exc,
+                )
+                compute_cpu = "int8" if compute == "float16" else compute
+                try:
+                    _whisper_model = WhisperModel(size, device="cpu", compute_type=compute_cpu)
+                    _whisper_device = "cpu"
+                    _whisper_force_cpu = True  # não tenta CUDA de novo nesta sessão
+                except Exception as exc_cpu:
+                    raise RuntimeError(
+                        f"Falha ao carregar Whisper mesmo em CPU ({exc_cpu}). "
+                        "Verifique faster-whisper/ctranslate2 e o tamanho do modelo."
+                    ) from exc_cpu
+            else:
+                raise RuntimeError(
+                    f"Falha ao carregar Whisper em CPU ({exc}). "
+                    "Verifique faster-whisper/ctranslate2 e o tamanho do modelo."
+                ) from exc
+
+        log.info(
+            "Modelo Whisper carregado e em cache (size=%s, device=%s).",
+            size,
+            _whisper_device,
+        )
+        return _whisper_model
 
 
 def transcribe_whisper(audio: np.ndarray, *, rapido: bool = False) -> str:
@@ -1197,6 +1219,7 @@ def _whisper_stream_worker() -> None:
     """Overlay ao vivo: re-transcreve a janela recente."""
     ultimo_n = 0
     primeiro = True
+    push_live("Carregando modelo…")
     try:
         if _whisper_compartilha_modelo_preview():
             load_whisper_model()
@@ -1204,6 +1227,7 @@ def _whisper_stream_worker() -> None:
             load_whisper_preview_model()
     except Exception as exc:
         log.warning("Preview Whisper indisponível: %s", exc)
+        push_live("Preview indisponível")
         return
 
     while _whisper_stream_active:
@@ -1416,6 +1440,59 @@ def _mensagem_erro_saida(exc: BaseException) -> str:
 _target_hwnd = None
 
 
+# === INSTÂNCIA ÚNICA ===
+# Duas cópias do assistente escutando a MESMA hotkey é a causa clássica de
+# "está digitando no modo clipboard": a cópia antiga (com type em memória)
+# continua viva e cola, enquanto a nova (clipboard) só copia. Um lockfile
+# (arquivo travado) garante que só uma instância rode por vez no mesmo usuário.
+_LOCKFILE_PATH = Path(tempfile.gettempdir()) / "assistente_voz_instancia.lock"
+_arquivo_lock = None  # handle do arquivo aberto (mantém o lock vivo)
+
+
+def _adquirir_instancia_unica() -> None:
+    """
+    Adquire um lock exclusivo de instância única (Windows/Linux/macOS).
+
+    Cria/abre o lockfile com 'w' e tenta flock (Windows usa msvcrt). Se outra
+    instância já o detém, exibe aviso em PT e encerra o processo sem abrir UI.
+    O lock é liberado automaticamente quando o processo termina (arquivo fecha).
+    """
+    global _arquivo_lock
+    try:
+        _arquivo_lock = open(_LOCKFILE_PATH, "w")
+        if sys.platform == "win32":
+            import msvcrt
+
+            try:
+                msvcrt.locking(_arquivo_lock.fileno(), msvcrt.LK_NBLCK, 1)
+            except OSError:
+                _arquivo_lock.close()
+                _arquivo_lock = None
+                log.error(
+                    "Outra instância do Assistente de Voz já está em execução. "
+                    "Feche-a antes de abrir uma nova (evita colagem fantasma na hotkey)."
+                )
+                sys.exit(1)
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(_arquivo_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                _arquivo_lock.close()
+                _arquivo_lock = None
+                log.error(
+                    "Outra instância do Assistente de Voz já está em execução. "
+                    "Feche-a antes de abrir uma nova (evita colagem fantasma na hotkey)."
+                )
+                sys.exit(1)
+    except OSError as exc:
+        # Lock indisponível (pasta temporária sem escrita?): segue sem trava,
+        # mas avisa — o fluxo não deve quebrar por causa do lockfile.
+        log.warning("Não foi possível criar lock de instância única (%s).", exc)
+        _arquivo_lock = None
+
+
 def _capturar_janela_alvo() -> None:
     """Guarda a janela em primeiro plano (Windows) para restaurar no deliver."""
     global _target_hwnd
@@ -1451,7 +1528,13 @@ def _focar_janela_alvo() -> bool:
 
 
 def _colar_via_atalho() -> None:
-    """Simula Ctrl+V (Cmd+V no Darwin/macOS) no campo em foco."""
+    """Simula Ctrl+V (Cmd+V no Darwin/macOS) no campo em foco.
+
+    Proteção: no modo clipboard nunca deve ser chamado.
+    """
+    if (OUTPUT_MODE or "").strip().lower() == "clipboard":
+        log.error("Bloqueado: tentativa de colar com OUTPUT_MODE=clipboard.")
+        return
     controlador = keyboard.Controller()
     modificador = keyboard.Key.cmd if sys.platform == "darwin" else keyboard.Key.ctrl
     with controlador.pressed(modificador):
@@ -1463,14 +1546,12 @@ def _copiar_clipboard(texto: str) -> None:
     """
     Copia texto para a área de transferência de forma confiável.
 
-    No Windows usa a API nativa (CF_UNICODETEXT) com retries — o pyperclip
-    às vezes falha silenciosamente quando o clipboard está ocupado. Nos outros
-    SOs (e como fallback) usa pyperclip.
+    No Windows usa a API nativa (CF_UNICODETEXT) com retries. Nunca simula
+    teclas / Ctrl+V — só grava no clipboard.
     """
     if sys.platform == "win32":
         try:
             import ctypes
-            from ctypes import wintypes
 
             user32 = ctypes.windll.user32
             kernel32 = ctypes.windll.kernel32
@@ -1496,20 +1577,15 @@ def _copiar_clipboard(texto: str) -> None:
                     if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
                         kernel32.GlobalFree(h_mem)
                         raise OSError("SetClipboardData falhou")
-                    # Verifica se ficou na área de transferência
                     return
                 finally:
                     user32.CloseClipboard()
-            # Se OpenClipboard nunca abriu, cai no pyperclip
         except Exception as exc:
             log.debug("Clipboard Win32 falhou (%s); tentando pyperclip.", exc)
 
     pyperclip.copy(texto)
-    # Confirma leitura (quando a API permitir)
     try:
-        lido = pyperclip.paste()
-        if lido != texto:
-            # Segunda tentativa
+        if pyperclip.paste() != texto:
             time.sleep(0.05)
             pyperclip.copy(texto)
     except Exception:
@@ -1526,43 +1602,44 @@ def _toast_ui(mensagem: str) -> None:
         pass
 
 
-def deliver_text(texto: str) -> None:
+def deliver_text(texto: str, modo: Optional[str] = None) -> None:
     """
-    Entrega o texto reconhecido conforme ``OUTPUT_MODE``.
+    Entrega o texto reconhecido conforme ``OUTPUT_MODE`` (ou ``modo`` explícito).
 
-    - ``clipboard``: SOMENTE copia (não digita / não cola). Overlay já mostra
-      o texto via set_ui_state; o usuário cola com Ctrl+V quando quiser.
+    - ``clipboard``: SOMENTE copia após a transcrição final. Não foca janela,
+      não digita, não cola (Ctrl+V). Overlay mostra o texto; usuário cola à mão.
     - ``type``: restaura a janela alvo e cola via clipboard + Ctrl+V/Cmd+V.
-
-    Texto vazio ou só espaços: registra e retorna sem ação.
     """
     if texto is None or not str(texto).strip():
         log.info("deliver_text: texto vazio — nada a entregar.")
         return
 
     conteudo = str(texto)
-    modo = (OUTPUT_MODE or "type").strip().lower()
+    modo_efetivo = (modo or OUTPUT_MODE or "type").strip().lower()
 
     try:
-        if modo == "clipboard":
-            # Nunca simular digitação/Ctrl+V neste modo.
+        if modo_efetivo == "clipboard":
+            # Caminho isolado: zero SendInput / zero SetForegroundWindow.
             _copiar_clipboard(conteudo)
             log.info(
-                "Clipboard: copiado (%d chars) — sem digitar. Use Ctrl+V para colar.",
+                "Clipboard: copiado (%d chars) — SEM digitar/colar. Use Ctrl+V.",
                 len(conteudo),
             )
             _toast_ui("Copiado — Ctrl+V para colar")
             return
 
-        if modo != "type":
+        if modo_efetivo != "type":
             log.warning(
                 "OUTPUT_MODE=%r desconhecido; usando 'type'. Válidos: type, clipboard.",
-                OUTPUT_MODE,
+                modo_efetivo,
             )
 
         _copiar_clipboard(conteudo)
         _focar_janela_alvo()
         time.sleep(0.08)
+        if (OUTPUT_MODE or "").strip().lower() == "clipboard":
+            log.error("Abortado Ctrl+V: OUTPUT_MODE virou clipboard no meio da entrega.")
+            return
         _colar_via_atalho()
         log.info("Type: texto colado no foco (%d chars).", len(conteudo))
 
@@ -1683,7 +1760,7 @@ _ui_window = None
 
 # Tamanho do overlay compacto (largura, altura). O painel de configurações
 # expande a janela via Api.resize_window("settings").
-_UI_OVERLAY_SIZE = (380, 168)
+_UI_OVERLAY_SIZE = (380, 124)
 
 
 def push_ui() -> None:
@@ -1890,6 +1967,23 @@ class Api:
             log.debug("resize_window(%s) falhou: %s", mode, exc)
             return {"ok": False, "error": str(exc)}
 
+    def resize_overlay(self, width: int, height: int) -> dict:
+        """
+        Expande/reduz o overlay conforme o texto da transcrição (auto-fit).
+
+        Chamado pelo JS conforme o conteúdo cresce; clamped pelo backend.
+        """
+        try:
+            if _ui_window is None:
+                return {"ok": False, "error": "Janela indisponível."}
+            w = max(360, min(560, int(width)))
+            h = max(112, min(360, int(height)))
+            _ui_window.resize(w, h)
+            return {"ok": True, "w": w, "h": h}
+        except Exception as exc:
+            log.debug("resize_overlay(%sx%s) falhou: %s", width, height, exc)
+            return {"ok": False, "error": str(exc)}
+
     def quit(self) -> dict:
         """Fecha a janela da UI e encerra o programa."""
         try:
@@ -2084,6 +2178,9 @@ def main() -> None:
     """
     # Prepara a configuração ANTES de listar dispositivos/registrar hotkey.
     _inicializar_config()
+    # Garante que só uma cópia do assistente escute a hotkey global. Se outra
+    # instância estiver ativa, o aviso é exibido e o processo é encerrado.
+    _adquirir_instancia_unica()
 
     engine = (ENGINE or "").strip().lower()
     if engine not in ("vosk", "whisper"):

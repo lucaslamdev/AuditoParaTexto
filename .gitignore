@@ -22,6 +22,9 @@ wavs/
 *.flac
 *.ogg
 
+# Logs de execução
+*.log
+
 # IDE / SO
 .idea/
 .vscode/

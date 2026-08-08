@@ -3,7 +3,7 @@
     "WHISPER_SIZE": "turbo",
     "WHISPER_COMPUTE": "int8",
     "DEVICE": "auto",
-    "OUTPUT_MODE": "clipboard",
+    "OUTPUT_MODE": "type",
     "HOTKEY": "Ctrl+Shift+Space",
     "VOSK_MODEL_PATH": "models/vosk-model-small-pt",
     "SAMPLE_RATE": 16000,
