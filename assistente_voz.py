@@ -594,11 +594,13 @@ def _pipeline_apos_parar() -> None:
         if vosk_stream_ativo():
             texto = vosk_stream_finish()
         else:
-            # Whisper: para o preview antes da transcrição final (evita uso
-            # concorrente do modelo) e transcreve o áudio completo.
+            # Whisper: encerra preview/warm e reutiliza pass paralelo se fresco.
             if whisper_stream_ativo():
                 whisper_stream_finish()
-            texto = transcribe(audio)
+            if (ENGINE or "").strip().lower() == "whisper":
+                texto = whisper_final_rapido(audio)
+            else:
+                texto = transcribe(audio)
         if not texto or not str(texto).strip():
             log.info("Transcrição vazia — nada a entregar.")
             return
@@ -608,8 +610,11 @@ def _pipeline_apos_parar() -> None:
             OUTPUT_MODE,
             len(texto),
         )
+        # Mostra o texto final no overlay ANTES da entrega (clipboard/type).
+        set_ui_state("transcribing", last_text=texto)
+        push_live(texto)
         deliver_text(texto)
-        # UI: entregou o texto → volta para idle exibindo o último reconhecido
+        # UI: entregou o texto → idle com o último reconhecido no overlay
         set_ui_state("idle", last_text=texto)
     except RuntimeError as exc:
         # modelo ausente, ENGINE inválido, CUDA/CPU falhou, etc.
@@ -1031,11 +1036,12 @@ def load_whisper_model(force_cpu: bool = False):
     return _whisper_model
 
 
-def transcribe_whisper(audio: np.ndarray) -> str:
+def transcribe_whisper(audio: np.ndarray, *, rapido: bool = False) -> str:
     """
-    Transcreve áudio mono float32 em [-1, 1] com Faster-Whisper (idioma ``pt``).
+    Transcreve áudio mono float32 com o modelo configurado (WHISPER_SIZE).
 
-    Retorna string vazia se o áudio for nulo/vazio.
+    ``rapido=True``: beam_size=1 (overlay / passes paralelos leves).
+    ``rapido=False``: qualidade normal (entrega final autoritativa).
     """
     if audio is None or getattr(audio, "size", 0) == 0:
         return ""
@@ -1043,15 +1049,22 @@ def transcribe_whisper(audio: np.ndarray) -> str:
     global _whisper_model, _whisper_force_cpu
 
     samples = np.asarray(audio, dtype=np.float32).reshape(-1)
-    # Serializa acesso ao modelo: o preview ao vivo e a transcrição final nunca
-    # rodam concorrentes (o WhisperModel não é seguro para uso simultâneo).
+    opts: dict = {"language": "pt"}
+    if rapido:
+        opts.update(
+            beam_size=1,
+            best_of=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+
     with _whisper_lock:
         model = load_whisper_model()
         try:
-            segments, _info = model.transcribe(samples, language="pt")
+            segments, _info = model.transcribe(samples, **opts)
             texto = "".join(seg.text for seg in segments).strip()
         except Exception as exc:
-            # Ex.: cublas64_12.dll ausente quando DEVICE=cuda/auto sem CUDA.
             if _whisper_device != "cpu":
                 log.warning(
                     "Falha na inferência Whisper em '%s' (%s). Recarregando em CPU.",
@@ -1059,39 +1072,144 @@ def transcribe_whisper(audio: np.ndarray) -> str:
                     exc,
                 )
                 _whisper_model = None
-                _whisper_force_cpu = True  # não tenta CUDA de novo nesta sessão
+                _whisper_force_cpu = True
                 model = load_whisper_model(force_cpu=True)
-                segments, _info = model.transcribe(samples, language="pt")
+                segments, _info = model.transcribe(samples, **opts)
                 texto = "".join(seg.text for seg in segments).strip()
             else:
                 raise
-    log.info("Whisper: %d amostras → %d chars.", samples.shape[0], len(texto))
+    if not rapido:
+        log.info("Whisper: %d amostras → %d chars.", samples.shape[0], len(texto))
+    else:
+        log.debug("Whisper rápido: %d amostras → %d chars.", samples.shape[0], len(texto))
     return texto
 
 
-# --- Whisper em pseudo-streaming (transcrição ao vivo) -----------------------
-# O Faster-Whisper não transcreve em fluxo contínuo como o Vosk. Para dar um
-# preview ao vivo, uma thread re-transcreve periodicamente TODO o áudio já
-# capturado e envia o resultado ao overlay. Ao parar, o pipeline faz a
-# transcrição final do áudio completo (autoritativa) — este preview é
-# best-effort e não substitui o resultado final.
+# --- Whisper streaming / paralelo --------------------------------------------
+# - tiny/base: o MESMO modelo serve overlay + final (sem duplicar pesos).
+# - small/medium/turbo: overlay usa modelo leve (base/cpu); em paralelo o modelo
+#   escolhido já vai transcrevendo o buffer (warm) para o STOP ser quase instantâneo.
 
-WHISPER_STREAM_INTERVAL = 2.0   # segundos entre re-transcrições do preview
-WHISPER_STREAM_MIN_SEG = 1.0    # só começa a transcrever após ~1s de áudio
+WHISPER_PREVIEW_FALLBACK_SIZE = "base"
+WHISPER_PREVIEW_WINDOW_SEC = 6.0
+WHISPER_STREAM_INTERVAL = 1.0
+WHISPER_STREAM_MIN_SEG = 0.7
+WHISPER_WARM_MAX_GAP_SEC = 2.0  # reutiliza warm se faltou ≤2s de áudio no fim
 
+_whisper_preview_model = None
+_whisper_preview_lock = threading.Lock()
 _whisper_stream_active = False
 _whisper_stream_thread: Optional[threading.Thread] = None
 _whisper_stream_stop: Optional[threading.Event] = None
+_whisper_warm_thread: Optional[threading.Thread] = None
+_whisper_warm_text = ""
+_whisper_warm_n = 0
+_whisper_warm_lock = threading.Lock()
+
+
+def _whisper_compartilha_modelo_preview() -> bool:
+    """True se o modelo escolhido já é leve o bastante para o overlay (tiny/base)."""
+    return (WHISPER_SIZE or "").strip().lower() in ("tiny", "base")
+
+
+def _whisper_warm_interval() -> float:
+    """Intervalo entre passes do modelo final em paralelo (por tamanho)."""
+    size = (WHISPER_SIZE or "base").strip().lower()
+    return {
+        "tiny": 1.2,
+        "base": 1.5,
+        "small": 2.5,
+        "medium": 3.5,
+        "turbo": 4.0,
+    }.get(size, 2.5)
+
+
+def load_whisper_preview_model():
+    """Modelo leve só para overlay quando WHISPER_SIZE não é tiny/base."""
+    global _whisper_preview_model
+    if _whisper_compartilha_modelo_preview():
+        return load_whisper_model()
+    if _whisper_preview_model is not None:
+        return _whisper_preview_model
+    from faster_whisper import WhisperModel
+
+    log.info(
+        "Carregando Whisper PREVIEW (%s/cpu/int8) — separado de WHISPER_SIZE=%s...",
+        WHISPER_PREVIEW_FALLBACK_SIZE,
+        WHISPER_SIZE,
+    )
+    _whisper_preview_model = WhisperModel(
+        WHISPER_PREVIEW_FALLBACK_SIZE, device="cpu", compute_type="int8"
+    )
+    log.info("Whisper PREVIEW pronto.")
+    return _whisper_preview_model
+
+
+def _audio_janela(samples: np.ndarray, janela_s: float) -> np.ndarray:
+    max_n = int(janela_s * SAMPLE_RATE)
+    if samples.shape[0] > max_n:
+        return samples[-max_n:]
+    return samples
+
+
+def transcribe_whisper_preview(audio: np.ndarray) -> str:
+    """Texto rápido para o overlay (não entrega; não substitui o final)."""
+    if audio is None or getattr(audio, "size", 0) == 0:
+        return ""
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    samples = _audio_janela(samples, WHISPER_PREVIEW_WINDOW_SEC)
+
+    if _whisper_compartilha_modelo_preview():
+        # Mesmo modelo configurado (tiny/base) — evita duplicar em memória.
+        return transcribe_whisper(samples, rapido=True)
+
+    with _whisper_preview_lock:
+        model = load_whisper_preview_model()
+        segments, _info = model.transcribe(
+            samples,
+            language="pt",
+            beam_size=1,
+            best_of=1,
+            vad_filter=False,
+            condition_on_previous_text=False,
+            without_timestamps=True,
+        )
+        return "".join(seg.text for seg in segments).strip()
+
+
+def _whisper_set_warm(texto: str, n_amostras: int) -> None:
+    global _whisper_warm_text, _whisper_warm_n
+    with _whisper_warm_lock:
+        _whisper_warm_text = texto or ""
+        _whisper_warm_n = int(n_amostras)
+
+
+def _whisper_get_warm() -> tuple[str, int]:
+    with _whisper_warm_lock:
+        return _whisper_warm_text, _whisper_warm_n
+
+
+def _whisper_clear_warm() -> None:
+    _whisper_set_warm("", 0)
 
 
 def _whisper_stream_worker() -> None:
-    """Thread do preview: re-transcreve o buffer acumulado a cada intervalo."""
+    """Overlay ao vivo: re-transcreve a janela recente."""
     ultimo_n = 0
+    primeiro = True
+    try:
+        if _whisper_compartilha_modelo_preview():
+            load_whisper_model()
+        else:
+            load_whisper_preview_model()
+    except Exception as exc:
+        log.warning("Preview Whisper indisponível: %s", exc)
+        return
+
     while _whisper_stream_active:
-        # Espera o intervalo (interrompível pelo stop) antes de transcrever.
-        if _whisper_stream_stop is not None and _whisper_stream_stop.wait(
-            WHISPER_STREAM_INTERVAL
-        ):
+        espera = 0.35 if primeiro else WHISPER_STREAM_INTERVAL
+        primeiro = False
+        if _whisper_stream_stop is not None and _whisper_stream_stop.wait(espera):
             break
         if not _whisper_stream_active:
             break
@@ -1104,48 +1222,157 @@ def _whisper_stream_worker() -> None:
         n = int(audio.shape[0])
         if n / float(SAMPLE_RATE) < WHISPER_STREAM_MIN_SEG:
             continue
-        if n == ultimo_n:  # nada de novo desde a última passada
+        if n == ultimo_n:
             continue
         ultimo_n = n
         try:
-            texto = transcribe_whisper(np.asarray(audio, dtype=np.float32))
-            if _whisper_stream_active and texto:
-                push_live(texto)
+            if _whisper_compartilha_modelo_preview():
+                # tiny/base: buffer completo no mesmo modelo (overlay = warm)
+                texto = transcribe_whisper(
+                    np.asarray(audio, dtype=np.float32), rapido=True
+                )
+                if texto:
+                    push_live(texto)
+                    _whisper_set_warm(texto, n)
+            else:
+                texto = transcribe_whisper_preview(
+                    np.asarray(audio, dtype=np.float32)
+                )
+                if texto:
+                    push_live(texto)
         except Exception as exc:
             log.debug("Preview Whisper: %s", exc)
 
 
+def _whisper_warm_worker() -> None:
+    """
+    Passes em paralelo com o modelo SELECIONADO no buffer completo.
+
+    Enquanto grava, já vai preparando um resultado quase-final. No STOP,
+    se o warm cobriu quase todo o áudio, reutiliza e evita outra inferência longa.
+    (Só sobe esta thread quando o modelo NÃO é tiny/base — nesses casos o
+    próprio preview já atualiza o warm.)
+    """
+    ultimo_n = 0
+    try:
+        load_whisper_model()
+    except Exception as exc:
+        log.warning("Warm Whisper indisponível: %s", exc)
+        return
+
+    while _whisper_stream_active:
+        if _whisper_stream_stop is not None and _whisper_stream_stop.wait(
+            _whisper_warm_interval()
+        ):
+            break
+        if not _whisper_stream_active:
+            break
+        with _audio_lock:
+            if not _audio_chunks:
+                continue
+            audio = np.concatenate(_audio_chunks, axis=0)
+        if audio.ndim > 1:
+            audio = audio.reshape(-1)
+        n = int(audio.shape[0])
+        if n / float(SAMPLE_RATE) < max(WHISPER_STREAM_MIN_SEG, 1.5):
+            continue
+        if n == ultimo_n:
+            continue
+        # Se o modelo ainda está ocupado (outro warm), pula o ciclo
+        if not _whisper_lock.acquire(blocking=False):
+            continue
+        _whisper_lock.release()
+        try:
+            texto = transcribe_whisper(np.asarray(audio, dtype=np.float32), rapido=True)
+            if texto:
+                ultimo_n = n
+                _whisper_set_warm(texto, n)
+                log.debug("Warm Whisper: %d amostras → %d chars.", n, len(texto))
+        except Exception as exc:
+            log.debug("Warm Whisper: %s", exc)
+
+
+def whisper_final_rapido(audio: np.ndarray) -> str:
+    """
+    Resultado no STOP: reutiliza warm paralelo se estiver fresco; senão transcreve.
+
+    Evita reprocessar do zero quando o modelo escolhido já rodou em paralelo.
+    """
+    samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+    n = int(samples.shape[0])
+    warm_texto, warm_n = _whisper_get_warm()
+    gap_s = (n - warm_n) / float(SAMPLE_RATE) if n >= warm_n else 999.0
+
+    if warm_texto and gap_s <= WHISPER_WARM_MAX_GAP_SEC:
+        log.info(
+            "Whisper: reutilizando pass paralelo (warm) — gap=%.2fs, %d chars.",
+            gap_s,
+            len(warm_texto),
+        )
+        if gap_s > 0.45:
+            try:
+                texto = transcribe_whisper(samples, rapido=False)
+                if texto:
+                    return texto
+            except Exception as exc:
+                log.debug("Refine pós-warm falhou (%s); usando warm.", exc)
+        return warm_texto
+
+    return transcribe_whisper(samples, rapido=False)
+
+
 def whisper_stream_start() -> bool:
-    """Inicia o preview ao vivo do Whisper (thread de re-transcrição)."""
+    """Inicia preview ao vivo (+ warm paralelo se o modelo for maior que base)."""
     global _whisper_stream_active, _whisper_stream_thread, _whisper_stream_stop
-    global _vosk_live_text
+    global _whisper_warm_thread, _vosk_live_text
     if _whisper_stream_active:
         return True
     _vosk_live_text = ""
+    _whisper_clear_warm()
+    push_live("Ouvindo…")
     _whisper_stream_stop = threading.Event()
     _whisper_stream_active = True
     _whisper_stream_thread = threading.Thread(
         target=_whisper_stream_worker,
-        name="whisper-stream",
+        name="whisper-preview",
         daemon=True,
     )
     _whisper_stream_thread.start()
-    log.info("Preview Whisper ativo — transcrição ao vivo (best-effort).")
+
+    _whisper_warm_thread = None
+    if not _whisper_compartilha_modelo_preview():
+        _whisper_warm_thread = threading.Thread(
+            target=_whisper_warm_worker,
+            name="whisper-warm",
+            daemon=True,
+        )
+        _whisper_warm_thread.start()
+        log.info(
+            "Preview Whisper: overlay=%s | paralelo=%s (warm).",
+            WHISPER_PREVIEW_FALLBACK_SIZE,
+            WHISPER_SIZE,
+        )
+    else:
+        log.info(
+            "Preview Whisper: mesmo modelo %s no overlay e no final (sem duplicar).",
+            WHISPER_SIZE,
+        )
     return True
 
 
 def whisper_stream_finish() -> None:
-    """Encerra o preview ao vivo do Whisper e aguarda a thread finalizar."""
-    global _whisper_stream_active, _whisper_stream_thread
-    if not _whisper_stream_active:
+    """Encerra preview/warm (não bloqueia a entrega final)."""
+    global _whisper_stream_active, _whisper_stream_thread, _whisper_warm_thread
+    if not _whisper_stream_active and _whisper_stream_thread is None:
         return
     _whisper_stream_active = False
     if _whisper_stream_stop is not None:
         _whisper_stream_stop.set()
-    thread = _whisper_stream_thread
-    if thread is not None and thread.is_alive():
-        thread.join(timeout=5.0)
+    for thread in (_whisper_stream_thread, _whisper_warm_thread):
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=0.35)
     _whisper_stream_thread = None
+    _whisper_warm_thread = None
 
 
 def whisper_stream_ativo() -> bool:
@@ -1232,16 +1459,82 @@ def _colar_via_atalho() -> None:
         controlador.release("v")
 
 
+def _copiar_clipboard(texto: str) -> None:
+    """
+    Copia texto para a área de transferência de forma confiável.
+
+    No Windows usa a API nativa (CF_UNICODETEXT) com retries — o pyperclip
+    às vezes falha silenciosamente quando o clipboard está ocupado. Nos outros
+    SOs (e como fallback) usa pyperclip.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            user32 = ctypes.windll.user32
+            kernel32 = ctypes.windll.kernel32
+            CF_UNICODETEXT = 13
+            GMEM_MOVEABLE = 0x0002
+
+            data = texto.encode("utf-16-le") + b"\x00\x00"
+            for _ in range(8):
+                if not user32.OpenClipboard(None):
+                    time.sleep(0.05)
+                    continue
+                try:
+                    user32.EmptyClipboard()
+                    h_mem = kernel32.GlobalAlloc(GMEM_MOVEABLE, len(data))
+                    if not h_mem:
+                        raise OSError("GlobalAlloc falhou")
+                    ptr = kernel32.GlobalLock(h_mem)
+                    if not ptr:
+                        kernel32.GlobalFree(h_mem)
+                        raise OSError("GlobalLock falhou")
+                    ctypes.memmove(ptr, data, len(data))
+                    kernel32.GlobalUnlock(h_mem)
+                    if not user32.SetClipboardData(CF_UNICODETEXT, h_mem):
+                        kernel32.GlobalFree(h_mem)
+                        raise OSError("SetClipboardData falhou")
+                    # Verifica se ficou na área de transferência
+                    return
+                finally:
+                    user32.CloseClipboard()
+            # Se OpenClipboard nunca abriu, cai no pyperclip
+        except Exception as exc:
+            log.debug("Clipboard Win32 falhou (%s); tentando pyperclip.", exc)
+
+    pyperclip.copy(texto)
+    # Confirma leitura (quando a API permitir)
+    try:
+        lido = pyperclip.paste()
+        if lido != texto:
+            # Segunda tentativa
+            time.sleep(0.05)
+            pyperclip.copy(texto)
+    except Exception:
+        pass
+
+
+def _toast_ui(mensagem: str) -> None:
+    """Mostra um toast curto no overlay (best-effort)."""
+    if _ui_window is None:
+        return
+    try:
+        _ui_window.evaluate_js(f"showToast({json.dumps(mensagem, ensure_ascii=False)})")
+    except Exception:
+        pass
+
+
 def deliver_text(texto: str) -> None:
     """
     Entrega o texto reconhecido conforme ``OUTPUT_MODE``.
 
-    - ``clipboard``: copia com ``pyperclip.copy`` (não digita).
-    - ``type``: restaura a janela alvo e cola via clipboard + Ctrl+V/Cmd+V
-      (mais confiável que ``Controller.type()`` com acentos PT e WebView).
+    - ``clipboard``: SOMENTE copia (não digita / não cola). Overlay já mostra
+      o texto via set_ui_state; o usuário cola com Ctrl+V quando quiser.
+    - ``type``: restaura a janela alvo e cola via clipboard + Ctrl+V/Cmd+V.
 
     Texto vazio ou só espaços: registra e retorna sem ação.
-    Erros de permissão/clipboard: mensagem em português no log.
     """
     if texto is None or not str(texto).strip():
         log.info("deliver_text: texto vazio — nada a entregar.")
@@ -1252,11 +1545,13 @@ def deliver_text(texto: str) -> None:
 
     try:
         if modo == "clipboard":
-            pyperclip.copy(conteudo)
+            # Nunca simular digitação/Ctrl+V neste modo.
+            _copiar_clipboard(conteudo)
             log.info(
-                "Texto copiado para a área de transferência (%d chars).",
+                "Clipboard: copiado (%d chars) — sem digitar. Use Ctrl+V para colar.",
                 len(conteudo),
             )
+            _toast_ui("Copiado — Ctrl+V para colar")
             return
 
         if modo != "type":
@@ -1265,14 +1560,11 @@ def deliver_text(texto: str) -> None:
                 OUTPUT_MODE,
             )
 
-        # type: clipboard + colar. Digitação direta do pynput falha com acentos
-        # PT e costuma ir para o overlay; restaurar foco + Ctrl+V é o caminho
-        # confiável no Windows (e funciona bem nos outros SOs também).
-        pyperclip.copy(conteudo)
+        _copiar_clipboard(conteudo)
         _focar_janela_alvo()
-        time.sleep(0.05)
+        time.sleep(0.08)
         _colar_via_atalho()
-        log.info("Texto colado no foco via atalho (%d chars).", len(conteudo))
+        log.info("Type: texto colado no foco (%d chars).", len(conteudo))
 
     except PermissionError as exc:
         log.error("%s", _mensagem_erro_saida(exc))
@@ -1344,13 +1636,34 @@ def _avisar_modelo_no_startup() -> None:
             )
         return
     if engine == "whisper":
+        compartilhado = (WHISPER_SIZE or "").strip().lower() in ("tiny", "base")
         log.info(
-            "Whisper: size=%s device=%s compute=%s — modelo carrega na 1ª transcrição "
-            "(CUDA falha → fallback CPU).",
+            "Whisper: size=%s device=%s compute=%s — "
+            "overlay=%s; warm paralelo=%s.",
             WHISPER_SIZE,
             DEVICE,
             WHISPER_COMPUTE,
+            WHISPER_SIZE if compartilhado else "base(cpu)",
+            "mesmo modelo" if compartilhado else WHISPER_SIZE,
         )
+        # Pré-carga em background: preview (se separado) + modelo escolhido.
+        threading.Thread(
+            target=_preload_whisper_modelos,
+            name="whisper-preload",
+            daemon=True,
+        ).start()
+
+
+def _preload_whisper_modelos() -> None:
+    """Pré-carrega preview (se preciso) e o modelo selecionado sem bloquear a UI."""
+    try:
+        if _whisper_compartilha_modelo_preview():
+            load_whisper_model()
+        else:
+            load_whisper_preview_model()
+            load_whisper_model()
+    except Exception as exc:
+        log.warning("Pré-carga Whisper falhou: %s", exc)
 
 
 # === UI (PyWebView) ===
@@ -1370,7 +1683,7 @@ _ui_window = None
 
 # Tamanho do overlay compacto (largura, altura). O painel de configurações
 # expande a janela via Api.resize_window("settings").
-_UI_OVERLAY_SIZE = (380, 150)
+_UI_OVERLAY_SIZE = (380, 168)
 
 
 def push_ui() -> None:
@@ -1393,6 +1706,12 @@ def push_ui() -> None:
                 "state": _ui_state,
                 "last_text": _ui_last_text,
                 "engine": ENGINE,
+                # Inclui live no push para o updateStatus não apagar o preview
+                # ao vivo com last_text vazio durante a gravação.
+                "live": _vosk_live_text
+                if _ui_state in ("recording", "transcribing")
+                else "",
+                "level": _ui_level if _ui_state == "recording" else 0.0,
             },
             ensure_ascii=False,
         )
@@ -1483,7 +1802,7 @@ class Api:
         modelo (_vosk_model/_whisper_model) para forçar recarga sob demanda.
         Retorna {"ok": True} em sucesso ou {"ok": False, "error": "..."} (PT).
         """
-        global _vosk_model, _whisper_model, _whisper_force_cpu
+        global _vosk_model, _whisper_model, _whisper_force_cpu, _whisper_preview_model
 
         if not isinstance(data, dict):
             return {"ok": False, "error": "Configuração inválida: esperado um objeto."}
@@ -1518,6 +1837,10 @@ class Api:
                 if _whisper_model is not None:
                     _whisper_model = None
                     log.info("Cache do modelo Whisper invalidado (config alterada).")
+                if _whisper_preview_model is not None:
+                    _whisper_preview_model = None
+                    log.info("Cache do Whisper PREVIEW invalidado (config alterada).")
+                _whisper_clear_warm()
                 # Troca explícita de DEVICE deve poder tentar CUDA de novo.
                 if DEVICE != device_antigo:
                     _whisper_force_cpu = False
@@ -1538,7 +1861,9 @@ class Api:
             "state": _ui_state,
             "last_text": _ui_last_text,
             "engine": ENGINE,
-            "live": _vosk_live_text if _ui_state == "recording" else "",
+            "live": _vosk_live_text
+            if _ui_state in ("recording", "transcribing")
+            else "",
             "level": _ui_level if _ui_state == "recording" else 0.0,
         }
 
@@ -1594,38 +1919,43 @@ def _hwnd_da_janela_ui(window) -> int:
 
 def _aplicar_glass_nativo(window) -> None:
     """
-    Aplica blur Acrylic/Mica nativo no Windows para o fundo translúcido real.
+    Aplica glass translúcido nativo no Windows sem usar transparent=True do
+    WebView2 (que no Windows costuma cair para fundo branco).
 
-    No Windows 11 tenta DWMWA_SYSTEMBACKDROP_TYPE (Acrylic). No Windows 10
-    (ou se o DWM falhar) usa SetWindowCompositionAttribute com Acrylic.
-    Em outros SOs é no-op (CSS backdrop-filter + transparent cuidam do visual).
+    Estratégia estável:
+      1) Acrylic/Mica DWM (blur do desktop atrás da janela)
+      2) WS_EX_LAYERED + alpha da janela inteira (translucidez real)
     """
     if sys.platform != "win32":
         return
     try:
         import ctypes
-        from ctypes import POINTER, Structure, byref, c_int, c_void_p, sizeof
+        from ctypes import Structure, byref, c_byte, c_int, c_void_p, sizeof
     except Exception:
         return
 
     # Pequena espera: o HWND só existe de forma estável após o show.
-    time.sleep(0.25)
+    time.sleep(0.35)
     hwnd = _hwnd_da_janela_ui(window)
     if not hwnd:
         log.debug("Glass nativo: HWND da UI não encontrado.")
         return
 
-    # Cantos arredondados (Win11) + tema escuro
+    user32 = ctypes.windll.user32
+    aplicado = False
+
+    # Cantos arredondados (Win11) + tema escuro + Acrylic
     try:
         dwm = ctypes.windll.dwmapi
         DWMWA_USE_IMMERSIVE_DARK_MODE = 20
         DWMWA_WINDOW_CORNER_PREFERENCE = 33
         DWMWA_SYSTEMBACKDROP_TYPE = 38
-        DWMWCP_ROUND = 2
+        DWMWCP_ROUND = 2  # ~12px — deve bater com --radius no CSS
         DWMSBT_TRANSIENT_WINDOW = 3  # Acrylic
 
         dark = c_int(1)
         dwm.DwmSetWindowAttribute(hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, byref(dark), sizeof(dark))
+        # Clip nativo dos cantos (evita “cantos quadrados” por cima do glass CSS)
         corner = c_int(DWMWCP_ROUND)
         dwm.DwmSetWindowAttribute(
             hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, byref(corner), sizeof(corner)
@@ -1636,51 +1966,65 @@ def _aplicar_glass_nativo(window) -> None:
         )
         if hr == 0:
             log.info("Glass nativo: Acrylic DWM (Windows 11) aplicado.")
-            return
+            aplicado = True
     except Exception as exc:
         log.debug("Glass nativo DWM indisponível: %s", exc)
 
     # Fallback Windows 10: AccentPolicy Acrylic blur behind
+    if not aplicado:
+        try:
+
+            class ACCENTPOLICY(Structure):
+                _fields_ = [
+                    ("AccentState", c_int),
+                    ("AccentFlags", c_int),
+                    ("GradientColor", c_int),
+                    ("AnimationId", c_int),
+                ]
+
+            class WINCOMPATTRDATA(Structure):
+                _fields_ = [
+                    ("Attribute", c_int),
+                    ("Data", c_void_p),
+                    ("SizeOfData", c_int),
+                ]
+
+            # 0xAABBGGRR — alpha ~0xB8 + tom preto
+            accent = ACCENTPOLICY(4, 2, 0xB80C0C0E, 0)
+            data = WINCOMPATTRDATA(
+                19,
+                ctypes.cast(ctypes.pointer(accent), c_void_p),
+                sizeof(accent),
+            )
+            ok = user32.SetWindowCompositionAttribute(hwnd, byref(data))
+            if ok:
+                log.info("Glass nativo: Acrylic (AccentPolicy) aplicado.")
+                aplicado = True
+        except Exception as exc:
+            log.debug("Glass nativo AccentPolicy falhou: %s", exc)
+
+    # Translucidez da janela inteira (não depende do transparent= do WebView2).
+    # Assim o desktop aparece por trás do vidro escuro, sem fundo branco.
     try:
-
-        class ACCENTPOLICY(Structure):
-            _fields_ = [
-                ("AccentState", c_int),
-                ("AccentFlags", c_int),
-                ("GradientColor", c_int),
-                ("AnimationId", c_int),
-            ]
-
-        class WINCOMPATTRDATA(Structure):
-            _fields_ = [
-                ("Attribute", c_int),
-                ("Data", c_void_p),
-                ("SizeOfData", c_int),
-            ]
-
-        # 0xAABBGGRR — alpha ~0xA0 + tom preto azulado
-        accent = ACCENTPOLICY(4, 2, 0xA00E0E12, 0)
-        data = WINCOMPATTRDATA(
-            19,
-            ctypes.cast(ctypes.pointer(accent), c_void_p),
-            sizeof(accent),
-        )
-        ok = ctypes.windll.user32.SetWindowCompositionAttribute(hwnd, byref(data))
-        if ok:
-            log.info("Glass nativo: Acrylic (AccentPolicy) aplicado.")
-        else:
-            log.debug("Glass nativo: SetWindowCompositionAttribute retornou 0.")
+        GWL_EXSTYLE = -20
+        WS_EX_LAYERED = 0x80000
+        LWA_ALPHA = 0x2
+        style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED)
+        # 238/255 ≈ 93% opaco — menos translúcido, ainda com leve vidro
+        user32.SetLayeredWindowAttributes(hwnd, 0, 238, LWA_ALPHA)
+        log.info("Glass nativo: alpha da janela aplicado (translucidez).")
     except Exception as exc:
-        log.debug("Glass nativo AccentPolicy falhou: %s", exc)
+        log.debug("Glass nativo alpha falhou: %s", exc)
 
 
 def run_ui() -> bool:
     """
     Abre a janela glass do PyWebView apontando para ui/index.html.
 
-    Janela frameless, transparente e on-top com bridge js_api=Api(). No Windows
-    aplica Acrylic nativo para o fundo translúcido real. webview.start() bloqueia
-    até fechar. Retorna True se a UI rodou; False se PyWebView indisponível.
+    Janela frameless/on-top com bridge js_api=Api(). No Windows, o fundo branco
+    do WebView2 transparente é evitado: usamos background escuro + Acrylic/alpha
+    nativos para o efeito de vidro. webview.start() bloqueia até fechar.
     """
     global _ui_window
 
@@ -1698,9 +2042,8 @@ def run_ui() -> bool:
     # Caminho absoluto para o HTML da interface (ao lado deste script)
     html_path = Path(__file__).resolve().parent / "ui" / "index.html"
 
-    # transparent=True: WebView2 com fundo transparente para o glass CSS
-    # (backdrop-filter) e o Acrylic nativo aparecerem. shadow=False evita
-    # artefatos opacos ao redor do pill no Windows.
+    # NÃO usar transparent=True no Windows/WebView2: cai para fundo branco.
+    # O glass vem do Acrylic DWM + alpha da janela + CSS escuro translúcido.
     _ui_window = webview.create_window(
         "Assistente de Voz",
         url=str(html_path),
@@ -1708,10 +2051,10 @@ def run_ui() -> bool:
         frameless=True,
         on_top=True,
         easy_drag=True,
-        transparent=True,
+        transparent=False,
+        # shadow do PyWebView é retangular e “vaza” nos cantos arredondados
         shadow=False,
-        vibrancy=True,
-        background_color="#000000",
+        background_color="#0C0C0E",
         width=_UI_OVERLAY_SIZE[0],
         height=_UI_OVERLAY_SIZE[1],
         resizable=False,

@@ -4,21 +4,21 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Assistente de Voz</title>
-  <style>html,body{background:transparent!important}</style>
+  <style>html,body{background:#0c0c0e!important}</style>
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
   <!-- Overlay compacto (pill) -->
   <div id="overlay" class="state-idle">
+    <div class="window-chrome">
+      <button id="btn-settings" class="icon-btn" type="button" title="Configurações" aria-label="Configurações">⚙</button>
+      <button id="btn-quit" class="icon-btn quit-btn" type="button" title="Fechar" aria-label="Fechar">×</button>
+    </div>
     <div class="overlay-row">
       <div class="overlay-status">
         <span id="status-dot" class="dot"></span>
         <span id="status-label">idle</span>
         <span id="engine" class="engine-tag">—</span>
-      </div>
-      <div class="overlay-actions">
-        <button id="btn-settings" class="icon-btn" type="button" title="Configurações" aria-label="Configurações">⚙</button>
-        <button id="btn-quit" class="icon-btn quit-btn" type="button" title="Fechar" aria-label="Fechar">×</button>
       </div>
     </div>
     <div class="level" aria-hidden="true"><div id="level-bar"></div></div>

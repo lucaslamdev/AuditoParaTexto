@@ -51,11 +51,16 @@ function updateStatus(payload) {
   if (engine && typeof payload.engine === "string" && payload.engine) {
     engine.textContent = payload.engine;
   }
-  // Durante a gravação, prioriza o parcial ao vivo (streaming Vosk); fora dela,
-  // mostra o último texto reconhecido. O polling de get_status entrega ambos.
+  // recording/transcribing: mostra 'live' (parcial). idle: mostra last_text.
+  // Nunca apagar o parcial com last_text vazio no meio da fala.
   if (lastText) {
-    if (state === "recording" && payload.live !== undefined) {
-      lastText.textContent = payload.live || "";
+    if (state === "recording" || state === "transcribing") {
+      if (typeof payload.live === "string" && payload.live.length) {
+        lastText.textContent = payload.live;
+      } else if (payload.last_text) {
+        lastText.textContent = payload.last_text;
+      }
+      // se live/last_text vazios, mantém o que já está no overlay
     } else if (payload.last_text !== undefined) {
       lastText.textContent = payload.last_text || "";
     }
@@ -229,6 +234,7 @@ function showToast(mensagem) {
   clearTimeout(toast._t);
   toast._t = setTimeout(() => (toast.style.opacity = "0"), 1400);
 }
+window.showToast = showToast;
 
 // ---- Polling de status (fallback quando eventos não chegam) ------------
 

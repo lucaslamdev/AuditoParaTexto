@@ -1,9 +1,9 @@
 {
     "ENGINE": "whisper",
-    "WHISPER_SIZE": "small",
+    "WHISPER_SIZE": "turbo",
     "WHISPER_COMPUTE": "int8",
     "DEVICE": "auto",
-    "OUTPUT_MODE": "type",
+    "OUTPUT_MODE": "clipboard",
     "HOTKEY": "Ctrl+Shift+Space",
     "VOSK_MODEL_PATH": "models/vosk-model-small-pt",
     "SAMPLE_RATE": 16000,
